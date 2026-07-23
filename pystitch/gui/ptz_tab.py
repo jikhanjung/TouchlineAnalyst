@@ -3821,7 +3821,40 @@ class PtzTab(QWidget):
                 self._hide_radar()
         # 경기장 탭: 랜드마크 마커 + (캘리브레이션 후) 예상 경기장 선
         if self._field_tab_active() or self.btn_field_pick.isChecked():
-            if self._field_calib is not None:
+            rc = getattr(self, "_rc_calib", None) \
+                if getattr(self, "_is_rotcam", False) else None
+            if rc is not None:
+                # 회전 카메라: 필드 라인을 현재 프레임 카메라 자세로 투영.
+                # 기준 프레임 자세 → 현재 프레임 호모그래피로 이송.
+                from ..core.rotcam import field_to_pixel, transfer_points
+                Kr, Rr = rc["K"], rc["R"]
+                tr = -Rr @ np.asarray(rc["cam_pos"])
+                Href = self._rc_H(rc["ref_frame"],
+                                  int(getattr(self, "_cur_frame_idx",
+                                              self.slider.value())))
+                for line in field_outline(*self.field_size):
+                    q = field_to_pixel(Kr, Rr, tr, line)
+                    if Href is not None:
+                        fin = np.isfinite(q).all(1)
+                        if fin.any():
+                            q2 = np.full_like(q, np.nan)
+                            q2[fin] = transfer_points(Href, q[fin])
+                            q = q2
+                    seg = []
+                    for qx, qy in list(q) + [(np.nan, np.nan)]:
+                        ok = (np.isfinite(qx)
+                              and -0.2 * self.pano_w <= qx <= 1.2 * self.pano_w
+                              and -0.2 * self.pano_h <= qy <= 1.2 * self.pano_h)
+                        if ok:
+                            seg.append((qx, qy))
+                            continue
+                        if len(seg) >= 2:
+                            arr = np.array([[int(a * sc), int(b * sc)]
+                                            for a, b in seg], np.int32)
+                            cv2.polylines(frame, [arr], False,
+                                          (60, 220, 255), max(1, int(2 * sc)))
+                        seg = []
+            elif self._field_calib is not None:
                 for line in field_outline(*self.field_size):
                     q = field_to_pano(self._field_calib, line)
                     seg = []
