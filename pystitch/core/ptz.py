@@ -923,7 +923,10 @@ def player_aggregates(analysis, exclude_tids=None, base=None):
 def _track_iso_frac(analysis, t, iso_px):
     """트랙 점별 최근접 선수 거리 > iso_px 비율 (선수 없으면 0=근접 취급)."""
     far = 0
+    n_players = len(analysis["players"])
     for k, i in enumerate(t["i"]):
+        if int(i) >= n_players:               # 다른 analysis 의 낡은 인덱스
+            continue
         prow = analysis["players"][int(i)]
         if not prow:
             continue

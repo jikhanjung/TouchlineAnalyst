@@ -4225,7 +4225,9 @@ class PtzTab(QWidget):
               if self.pano_path else None)
         w = LinkWorker(self.analysis, analysis_path=ap,
                        video_path=self.pano_path)
-        w.done.connect(self._link_done)
+        w._analysis_id = id(self.analysis)    # 결과 도착 시 최신인지 확인
+        w.done.connect(lambda linked, aid=id(self.analysis):
+                       self._link_done(linked, aid))
         self._link_worker = w
         self.log("[ptz] 트랙 연결 계산 중... (완료 후 클릭 반응이 빨라짐)")
         w.start()
@@ -4294,7 +4296,12 @@ class PtzTab(QWidget):
         if cache:
             self._redraw()
 
-    def _link_done(self, linked):
+    def _link_done(self, linked, analysis_id=None):
+        # 영상 전환 레이스: 이 결과가 계산될 때의 analysis 가 아직 현재
+        # 것인지 확인 — 아니면 버린다 (옛 트랙 인덱스가 새 analysis
+        # 범위를 벗어나 IndexError 나던 문제)
+        if analysis_id is not None and analysis_id != id(self.analysis):
+            return
         # 레인 계산(트랙 요약·목록·트랙바)은 여기서 — 커서 표시 대상
         with self._wait():
             self._linked = linked
