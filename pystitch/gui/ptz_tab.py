@@ -3826,20 +3826,23 @@ class PtzTab(QWidget):
             if rc is not None:
                 # 회전 카메라: 필드 라인을 현재 프레임 카메라 자세로 투영.
                 # 기준 프레임 자세 → 현재 프레임 호모그래피로 이송.
+                # 이송(회전 계산)이 실패하면 그리지 않는다 — 엉뚱한 위치에
+                # 선을 그리느니 안 그리는 게 낫다 (사용자 방향).
                 from ..core.rotcam import field_to_pixel, transfer_points
                 Kr, Rr = rc["K"], rc["R"]
                 tr = -Rr @ np.asarray(rc["cam_pos"])
-                Href = self._rc_H(rc["ref_frame"],
-                                  int(getattr(self, "_cur_frame_idx",
-                                              self.slider.value())))
-                for line in field_outline(*self.field_size):
+                cur_f = int(getattr(self, "_cur_frame_idx",
+                                    self.slider.value()))
+                Href = self._rc_H(rc["ref_frame"], cur_f)
+                lines_iter = (field_outline(*self.field_size)
+                              if Href is not None else [])
+                for line in lines_iter:
                     q = field_to_pixel(Kr, Rr, tr, line)
-                    if Href is not None:
-                        fin = np.isfinite(q).all(1)
-                        if fin.any():
-                            q2 = np.full_like(q, np.nan)
-                            q2[fin] = transfer_points(Href, q[fin])
-                            q = q2
+                    fin = np.isfinite(q).all(1)
+                    if fin.any():
+                        q2 = np.full_like(q, np.nan)
+                        q2[fin] = transfer_points(Href, q[fin])
+                        q = q2
                     seg = []
                     for qx, qy in list(q) + [(np.nan, np.nan)]:
                         ok = (np.isfinite(qx)
