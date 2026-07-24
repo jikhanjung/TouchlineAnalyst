@@ -62,28 +62,34 @@ def build_trajectory(cap, grid, det_w, log):
                             interpolation=cv2.INTER_AREA)
         return cv2.cvtColor(fr, cv2.COLOR_BGR2GRAY), sc
 
-    grays = [None, None]                       # 직전 2개만 유지 (건너뛰기용)
-    grays[1] = gray(grid[0])
+    BR = 8                                      # 브리지 최대 뒤로 스텝 수
+    recent = [gray(grid[0])]                    # 최근 그레이 (뒤로 BR 개)
     Hcum = [np.eye(3)]
     n_ok = n_rep = 0
     t0 = time.perf_counter()
     for i in range(1, len(grid)):
         cur = gray(grid[i])
-        H = _homography(grays[1], cur)         # grid[i-1] → grid[i]
-        if H is not None:
+        H = _homography(recent[-1], cur)        # grid[i-1] → grid[i]
+        if H is not None and Hcum[i - 1] is not None:
             n_ok += 1
-        elif grays[0] is not None:             # 복구: grid[i-2] → grid[i]
-            H2 = _homography(grays[0], cur)
-            if H2 is not None and Hcum[i - 2] is not None:
-                Hcum.append(H2 @ Hcum[i - 2])  # i-2 기준으로 누적
-                grays = [grays[1], cur]
-                n_rep += 1
-                if len(Hcum) % 60 == 0:
-                    log(f"  궤적 {i}/{len(grid)-1} "
-                        f"({(time.perf_counter()-t0):.0f}s)")
-                continue
-        Hcum.append(None if (Hcum[-1] is None or H is None) else H @ Hcum[-1])
-        grays = [grays[1], cur]
+            Hcum.append(H @ Hcum[i - 1])
+        else:
+            # 끊김: 직전 유효 그리드로 직접 브리지 (고정 카메라 = 배경
+            # 매칭. 하프타임·급전환도 배경 공유하면 재연결)
+            done = False
+            for back in range(2, min(BR, len(recent)) + 1):
+                j = i - back
+                if j < 0 or Hcum[j] is None or recent[-back] is None:
+                    continue
+                Hb = _homography(recent[-back], cur)
+                if Hb is not None:
+                    Hcum.append(Hb @ Hcum[j]); n_rep += 1; done = True
+                    break
+            if not done:
+                Hcum.append(None)
+        recent.append(cur)
+        if len(recent) > BR:
+            recent.pop(0)
         if i % 60 == 0:
             log(f"  궤적 {i}/{len(grid)-1} ({(time.perf_counter()-t0):.0f}s)")
     return Hcum, n_ok, n_rep
@@ -97,23 +103,29 @@ def main():
     ap.add_argument("--det-w", type=int, default=1600)
     ap.add_argument("--record-sec", type=float, default=1.0,
                     help="사이드카에 자세 기록 간격(초)")
+    ap.add_argument("--traj-only", action="store_true",
+                    help="궤적 캐시(.rotcam_traj.npz)만 생성 (랜드마크 불요)")
+    ap.add_argument("--rebuild-traj", action="store_true",
+                    help="궤적 캐시 무시하고 재계산")
     args = ap.parse_args()
 
     vp = Path(args.video)
     sp = vp.with_suffix(".ptz.json")
-    if not sp.exists():
-        sys.exit(f"{sp.name} 없음 — PitchWatch 에서 랜드마크 먼저")
-    doc = json.loads(sp.read_text(encoding="utf-8"))
-    fpts = doc.get("field_points") or {}
-    frms = doc.get("field_point_frames") or {}
-    size = doc.get("field_size") or [105.0, 68.0]
+    size = [105.0, 68.0]
+    lms = []
+    if sp.exists():
+        doc = json.loads(sp.read_text(encoding="utf-8"))
+        fpts = doc.get("field_points") or {}
+        frms = doc.get("field_point_frames") or {}
+        size = doc.get("field_size") or size
+        pos = landmark_positions(size[0], size[1])
+        lms = [(k, fpts[k], int(frms[k])) for k in fpts
+               if k in frms and k not in LINE_LANDMARKS
+               and k not in VLINE_LANDMARKS and k in pos]
+    if not args.traj_only and len(lms) < 4:
+        sys.exit(f"위치 랜드마크 {len(lms)}개 (<4) — PitchWatch 에서 프레임 "
+                 "기록과 함께 더 찍어야 함 (또는 --traj-only 로 궤적만)")
     pos = landmark_positions(size[0], size[1])
-    lms = [(k, fpts[k], int(frms[k])) for k in fpts
-           if k in frms and k not in LINE_LANDMARKS
-           and k not in VLINE_LANDMARKS and k in pos]
-    if len(lms) < 4:
-        sys.exit(f"위치 랜드마크 {len(lms)}개 (<4) — 프레임 기록과 함께 "
-                 "더 찍어야 함")
 
     cap = cv2.VideoCapture(str(vp))
     if not cap.isOpened():
@@ -123,17 +135,38 @@ def main():
     fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
-    lm_max = max(f for _k, _p, f in lms)
     step = max(1, int(args.grid_sec * fps))
-    # 궤적은 랜드마크 범위 + 여유를 커버 (사이드카는 전체)
-    grid = list(range(0, min(lm_max + step, total), step))
+    # 랜드마크 있으면 그 범위+여유, 없으면(--traj-only) 전체 영상
+    hi = (min(max(f for _k, _p, f in lms) + step, total) if lms else total)
+    grid = list(range(0, hi, step))
     print(f"[rotcam] {W}x{H} @ {fps:.1f}fps, 랜드마크 {len(lms)}개, "
           f"궤적 그리드 {len(grid)}개 ({args.grid_sec}s)", flush=True)
 
-    Hcum, n_ok, n_rep = build_trajectory(cap, grid, args.det_w, print)
+    tcache = vp.with_suffix(".rotcam_traj.npz")
+    Hcum = None
+    if tcache.exists() and not args.rebuild_traj:
+        try:
+            z = np.load(tcache, allow_pickle=False)
+            if int(z["step"]) == step and int(z["det_w"]) == args.det_w \
+                    and int(z["n"]) == len(grid):
+                arr = z["Hcum"]                 # (N,3,3), NaN = None
+                Hcum = [None if np.isnan(a).any() else a for a in arr]
+                print(f"[rotcam] 궤적 캐시 재사용: {tcache.name}", flush=True)
+        except Exception as e:  # noqa: BLE001
+            print(f"[rotcam] 캐시 무시: {e}", flush=True)
+    if Hcum is None:
+        Hcum, n_ok, n_rep = build_trajectory(cap, grid, args.det_w, print)
+        arr = np.array([np.full((3, 3), np.nan) if h is None else h
+                        for h in Hcum], np.float64)
+        np.savez_compressed(tcache, Hcum=arr, step=step, det_w=args.det_w,
+                            n=len(grid))
+        print(f"[rotcam] 궤적: 링크 {n_ok}, 복구 {n_rep} → 캐시 "
+              f"{tcache.name}", flush=True)
     n_valid = sum(1 for h in Hcum if h is not None)
-    print(f"[rotcam] 궤적: 링크 성공 {n_ok}, 복구 {n_rep}, "
-          f"유효 자세 {n_valid}/{len(grid)}", flush=True)
+    print(f"[rotcam] 유효 자세 {n_valid}/{len(grid)}", flush=True)
+    if args.traj_only:
+        print("[rotcam] --traj-only: 궤적 캐시만 생성하고 종료", flush=True)
+        cap.release(); return
 
     ref_i = len(grid) // 2                      # 기준 = 중앙 그리드
     while ref_i < len(Hcum) and Hcum[ref_i] is None:
