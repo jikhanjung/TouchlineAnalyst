@@ -6230,9 +6230,8 @@ class PtzTab(QWidget):
             self._graycache[f] = g
         return g
 
-    def _rc_H(self, src, dst):
-        """src → dst 픽셀 이송 호모그래피 (원본 좌표계, 캐시).
-        순수 회전이라 시차 없이 정확. 실패 시 None."""
+    def _rc_H1(self, src, dst):
+        """src → dst 직접 호모그래피 (원본 좌표계, 캐시). 실패 시 None."""
         if src == dst:
             return np.eye(3)
         key = (int(src), int(dst))
@@ -6243,14 +6242,36 @@ class PtzTab(QWidget):
         H = None
         if ga is not None and gb is not None:
             pa, pb = match_frames(ga[0], gb[0])
-            if len(pa) >= 25:
+            if len(pa) >= 20:
                 Hs, mask = cv2.findHomography(pa, pb, cv2.RANSAC, 3.0)
-                if Hs is not None and mask is not None and mask.sum() >= 25:
+                # 인라이어 15 로 완화 — 약한 겹침(먼 팬)에서도 체인 연결
+                if Hs is not None and mask is not None and mask.sum() >= 15:
                     S = np.diag([ga[1], ga[1], 1.0])
                     T = np.diag([gb[1], gb[1], 1.0])
-                    H = np.linalg.inv(T) @ Hs @ S   # det_w → 원본 좌표
+                    H = np.linalg.inv(T) @ Hs @ S
         self._Hcache[key] = H
         return H
+
+    def _rc_H(self, src, dst):
+        """src → dst 이송 호모그래피. 직접 실패 시 랜드마크 프레임들을
+        경유해 체인 (인접 프레임은 배경 특징으로 잘 매칭 — 고정 카메라).
+        순수 회전이라 호모그래피가 정확히 합성된다. 실패 시 None."""
+        H = self._rc_H1(src, dst)
+        if H is not None:
+            return H
+        anchors = sorted(set(int(v) for v in self.field_point_frames.values())
+                         | {int(src), int(dst)})
+        if int(src) not in anchors or int(dst) not in anchors:
+            return None
+        i0, i1 = anchors.index(int(src)), anchors.index(int(dst))
+        path = anchors[i0:i1 + 1] if i0 < i1 else anchors[i1:i0 + 1][::-1]
+        Hm = np.eye(3)
+        for a, b in zip(path, path[1:]):
+            h = self._rc_H1(a, b)
+            if h is None:
+                return None
+            Hm = h @ Hm
+        return Hm
 
     def _rc_current_pose(self, cur=None):
         """현재 프레임의 카메라 자세 (R, f) — 위치·f 는 캘리브레이션 고정,
