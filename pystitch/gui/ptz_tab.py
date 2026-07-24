@@ -3828,21 +3828,18 @@ class PtzTab(QWidget):
                 # 기준 프레임 자세 → 현재 프레임 호모그래피로 이송.
                 # 이송(회전 계산)이 실패하면 그리지 않는다 — 엉뚱한 위치에
                 # 선을 그리느니 안 그리는 게 낫다 (사용자 방향).
-                from ..core.rotcam import field_to_pixel, transfer_points
-                Kr, Rr = rc["K"], rc["R"]
-                tr = -Rr @ np.asarray(rc["cam_pos"])
+                from ..core.rotcam import field_to_pixel
                 cur_f = int(getattr(self, "_cur_frame_idx",
                                     self.slider.value()))
-                Href = self._rc_H(rc["ref_frame"], cur_f)
-                lines_iter = (field_outline(*self.field_size)
-                              if Href is not None else [])
+                pose = self._rc_current_pose(cur_f)   # 프레임별 회전
+                if pose is not None:
+                    Kc, Rc = pose["K"], pose["R"]
+                    tc = -Rc @ np.asarray(rc["cam_pos"])
+                    lines_iter = field_outline(*self.field_size)
+                else:
+                    lines_iter = []           # 자세 못 풀면 라인 안 그림
                 for line in lines_iter:
-                    q = field_to_pixel(Kr, Rr, tr, line)
-                    fin = np.isfinite(q).all(1)
-                    if fin.any():
-                        q2 = np.full_like(q, np.nan)
-                        q2[fin] = transfer_points(Href, q[fin])
-                        q = q2
+                    q = field_to_pixel(Kc, Rc, tc, line)
                     seg = []
                     for qx, qy in list(q) + [(np.nan, np.nan)]:
                         ok = (np.isfinite(qx)
@@ -5961,6 +5958,7 @@ class PtzTab(QWidget):
     def _field_set_point(self, key, x, y):
         self.field_points[key] = [round(float(x), 1), round(float(y), 1)]
         self.field_point_frames[key] = int(self.slider.value())
+        self._rc_pose_gen = getattr(self, "_rc_pose_gen", 0) + 1
         self._refit_field(log_result=True)
         self._save_keyframes()
         self._refresh_field_list()
@@ -6253,6 +6251,56 @@ class PtzTab(QWidget):
                     H = np.linalg.inv(T) @ Hs @ S   # det_w → 원본 좌표
         self._Hcache[key] = H
         return H
+
+    def _rc_current_pose(self, cur=None):
+        """현재 프레임의 카메라 자세 (R, f) — 위치·f 는 캘리브레이션 고정,
+        회전만 이 프레임 랜드마크로 재추정 (rotcam.anchor_rotation).
+
+        회전 카메라라 프레임마다 R 만 바뀐다: 기준 프레임과 특징 매칭이
+        안 되는 프레임이라도 그 프레임에 랜드마크 3개만 있으면(찍었거나
+        이송됐거나) 자세를 풀 수 있다 — 매칭 안 되는 프레임에 랜드마크
+        찍어 라인을 되살리는 워크플로우 (사용자 방향). None = 불가."""
+        rc = getattr(self, "_rc_calib", None)
+        if rc is None:
+            return None
+        cur = int(self.slider.value() if cur is None else cur)
+        cache = getattr(self, "_rc_pose_cache", None)
+        if cache is None:
+            cache = self._rc_pose_cache = {}
+        # 랜드마크 지정/이동 시 무효화 키
+        gen = getattr(self, "_rc_pose_gen", 0)
+        if cache.get("_gen") != gen:
+            cache.clear()
+            cache["_gen"] = gen
+        if cur in cache:
+            return cache[cur]
+        from ..core.field import (LINE_LANDMARKS, VLINE_LANDMARKS,
+                                  landmark_positions)
+        from ..core.rotcam import anchor_rotation, transfer_points
+        pos = landmark_positions(self.field_size[0], self.field_size[1])
+        cam = np.asarray(rc["cam_pos"])
+        px, fld = [], []
+        for k, pt in self.field_points.items():
+            if k in LINE_LANDMARKS or k in VLINE_LANDMARKS or k not in pos:
+                continue
+            kf = self.field_point_frames.get(k)
+            if kf is None or int(kf) == cur:
+                p = pt
+            else:
+                H = self._rc_H(int(kf), cur)
+                if H is None:
+                    continue
+                p = [float(v) for v in transfer_points(H, [pt])[0]]
+            px.append(p)
+            fld.append([float(pos[k][0]), float(pos[k][1])])
+        got = None
+        if len(px) >= 3:
+            # f_span 넓게 — 팬 뿐 아니라 줌도 프레임마다 흡수 (AX700 은
+            # 드물지만 줌 함, 사용자 지적). 회전+줌 동시 추정.
+            got = anchor_rotation(cam, px, fld, rc["f"],
+                                  (self.pano_w, self.pano_h), f_span=0.35)
+        cache[cur] = got
+        return got
 
     def _rc_transfer_landmarks(self):
         """찍은 랜드마크를 현재 프레임으로 이송 → _lm_transferred.
