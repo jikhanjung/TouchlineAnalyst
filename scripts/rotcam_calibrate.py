@@ -27,7 +27,7 @@ from pystitch.core.field import (  # noqa: E402
 )
 from pystitch.core.rotcam import (  # noqa: E402
     bundle_calibrate, decompose_H, make_K, match_frames, rotation_average,
-)
+)  # noqa: E501
 
 
 def _homography(ga, gb, min_inl=15):
@@ -45,7 +45,8 @@ def _homography(ga, gb, min_inl=15):
     return np.linalg.inv(T) @ Hs @ S
 
 
-def build_trajectory(cap, grid, det_w, log):
+def build_trajectory(cap, grid, det_w, img_size, log):
+    W_HINT = img_size
     """그리드 프레임 인접 호모그래피 → grid[0] 기준 누적 (Hcum).
 
     끊긴 링크는 이웃 건너뛰기(gap+1)로 복구 — 한 프레임 실패가 이후
@@ -94,7 +95,31 @@ def build_trajectory(cap, grid, det_w, log):
             recent.pop(0)
         if i % 60 == 0:
             log(f"  궤적 {i}/{len(grid)-1} ({(time.perf_counter()-t0):.0f}s)")
-    return Hcum, n_ok, n_rep, all_gray
+    # 루프 클로저: 그레이가 메모리에 있는 지금 검출 (재로딩 회피).
+    # f0 로 체인 절대회전 근사 → 시야(yaw) 유사한 먼 쌍만 직접 SIFT.
+    valid = [i for i in range(len(grid)) if Hcum[i] is not None]
+    loop = []
+    if len(valid) >= 3:
+        ref = valid[len(valid) // 2]
+        Hri = np.linalg.inv(Hcum[ref])
+        K0 = make_K(0.9 * W_HINT[0], W_HINT[0], W_HINT[1])
+        R0 = {i: decompose_H(Hcum[i] @ Hri, K0)[0] for i in valid}
+        yaw = {i: np.arctan2(R0[i][0, 2], R0[i][2, 2]) for i in valid}
+        t1 = time.perf_counter()
+        for a in range(len(valid)):
+            i = valid[a]
+            for b in range(a + 8, len(valid)):
+                j = valid[b]
+                if abs(yaw[i] - yaw[j]) > np.deg2rad(6):
+                    continue
+                ang = np.rad2deg(np.arccos(np.clip(
+                    (np.trace(R0[i] @ R0[j].T) - 1) / 2, -1, 1)))
+                if ang < 6.0:
+                    Hd = _homography(all_gray.get(j), all_gray.get(i))
+                    if Hd is not None:
+                        loop.append((i, j, Hd))
+        log(f"  루프 클로저 {len(loop)}개 ({time.perf_counter()-t1:.0f}s)")
+    return Hcum, n_ok, n_rep, loop
 
 
 def main():
@@ -145,74 +170,41 @@ def main():
           f"궤적 그리드 {len(grid)}개 ({args.grid_sec}s)", flush=True)
 
     tcache = vp.with_suffix(".rotcam_traj.npz")
-    Hcum = None
+    Hcum = loop_H = None
     if tcache.exists() and not args.rebuild_traj:
         try:
-            z = np.load(tcache, allow_pickle=False)
+            z = np.load(tcache, allow_pickle=True)
             if int(z["step"]) == step and int(z["det_w"]) == args.det_w \
                     and int(z["n"]) == len(grid):
-                arr = z["Hcum"]                 # (N,3,3), NaN = None
-                Hcum = [None if np.isnan(a).any() else a for a in arr]
-                print(f"[rotcam] 궤적 캐시 재사용: {tcache.name}", flush=True)
+                Hcum = [None if np.isnan(a).any() else a for a in z["Hcum"]]
+                loop_H = [(int(i), int(j), Hd)
+                          for i, j, Hd in z["loop"]]
+                print(f"[rotcam] 궤적 캐시 재사용: {tcache.name} "
+                      f"(루프 {len(loop_H)}개)", flush=True)
         except Exception as e:  # noqa: BLE001
             print(f"[rotcam] 캐시 무시: {e}", flush=True)
-    all_gray = None
+            Hcum = None
     if Hcum is None:
-        Hcum, n_ok, n_rep, all_gray = build_trajectory(
-            cap, grid, args.det_w, print)
+        Hcum, n_ok, n_rep, loop_H = build_trajectory(
+            cap, grid, args.det_w, (W, H), print)
         arr = np.array([np.full((3, 3), np.nan) if h is None else h
                         for h in Hcum], np.float64)
-        np.savez_compressed(tcache, Hcum=arr, step=step, det_w=args.det_w,
-                            n=len(grid))
-        print(f"[rotcam] 궤적: 링크 {n_ok}, 복구 {n_rep} → 캐시 "
-              f"{tcache.name}", flush=True)
+        loop_arr = np.array([(i, j, Hd) for i, j, Hd in loop_H],
+                            dtype=object)
+        np.savez(tcache, Hcum=arr, loop=loop_arr, step=step,
+                 det_w=args.det_w, n=len(grid))
+        print(f"[rotcam] 궤적: 링크 {n_ok}, 복구 {n_rep}, 루프 "
+              f"{len(loop_H)} → 캐시 {tcache.name}", flush=True)
     n_valid = sum(1 for h in Hcum if h is not None)
     print(f"[rotcam] 유효 자세 {n_valid}/{len(grid)}", flush=True)
     if args.traj_only:
         print("[rotcam] --traj-only: 궤적 캐시만 생성하고 종료", flush=True)
         cap.release(); return
-    if all_gray is None:                        # 캐시 재사용 시 그레이 재로딩
-        all_gray = {}
-        for i, gf in enumerate(grid):
-            if Hcum[i] is None:
-                continue
-            cap.set(cv2.CAP_PROP_POS_FRAMES, gf)
-            ok, fr = cap.read()
-            if not ok:
-                continue
-            sc = args.det_w / fr.shape[1] if fr.shape[1] > args.det_w else 1.0
-            if sc < 1.0:
-                fr = cv2.resize(fr, (args.det_w, int(fr.shape[0] * sc)),
-                                interpolation=cv2.INTER_AREA)
-            all_gray[i] = (cv2.cvtColor(fr, cv2.COLOR_BGR2GRAY), sc)
 
     valid = [i for i in range(len(grid)) if Hcum[i] is not None]
     ref_i = valid[len(valid) // 2]              # 기준 = 중앙 유효 그리드
     Hri = np.linalg.inv(Hcum[ref_i])
-    # 인접 엣지 상대 호모그래피 (ref 기준 체인) — f 무관, 1회
     Hchain_rel = {i: (Hcum[i] @ Hri) for i in valid}   # ref → i
-
-    # 루프 클로저 후보: f0 로 체인 절대회전 근사 → 시야 유사(먼 쌍)만
-    # 직접 SIFT. 한 번만 (f 후보마다 재계산 안 함).
-    f0 = 0.9 * W; K0 = make_K(f0, W, H)
-    Rch0 = {i: decompose_H(Hchain_rel[i], K0)[0] for i in valid}
-    yaw = {i: np.arctan2(Rch0[i][0, 2], Rch0[i][2, 2]) for i in valid}
-    loop_H = []                                 # (i, j, H_ji) 원본좌표
-    t0 = time.perf_counter()
-    for a in range(len(valid)):
-        i = valid[a]
-        for b in range(a + 8, len(valid)):
-            j = valid[b]
-            if abs(yaw[i] - yaw[j]) > np.deg2rad(6):
-                continue                        # 시야 다름 — 스킵
-            ang = np.rad2deg(np.arccos(np.clip(
-                (np.trace(Rch0[i] @ Rch0[j].T) - 1) / 2, -1, 1)))
-            if ang < 6.0:
-                Hd = _homography(all_gray.get(j), all_gray.get(i))
-                if Hd is not None:
-                    loop_H.append((i, j, Hd))
-    print(f"[rotcam] 루프 클로저 {len(loop_H)}개 검출 "
-          f"({time.perf_counter()-t0:.0f}s)", flush=True)
 
     def averaged_rots(f):
         K = make_K(f, W, H)
