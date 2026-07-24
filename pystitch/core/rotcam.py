@@ -548,3 +548,72 @@ def transfer_points(H, pts):
     p = np.asarray(pts, np.float64).reshape(-1, 2)
     q = (H @ np.hstack([p, np.ones((len(p), 1))]).T).T
     return q[:, :2] / q[:, 2:3]
+
+
+# ---------------------------------------------------------------- 궤적 번들
+def bundle_calibrate(rel_rots, landmarks, img_size, cam_init,
+                     f_init_fracs=(0.5, 0.7, 0.9, 1.1), iters=100):
+    """궤적 상대회전 + 다프레임 랜드마크 → (cam_pos, f, R0) 번들 (P06-3).
+
+    순수 팬은 f 자가캘리브가 퇴화(devlog 060)하므로 f 는 랜드마크로
+    푼다 — 단, 여러 프레임 랜드마크를 궤적 회전(rel_rots)으로 한
+    추정에 모아 깊이 다양성으로 f 를 구속한다. 상대회전은 고정,
+    미지수는 cam_pos(3)+f(1)+절대회전 rvec(3)=7.
+
+    rel_rots: {frame: R_rel(기준→그 프레임 world→cam 상대회전)}.
+    landmarks: [(px[2], field[2], frame)]. 반환 {cam_pos,f,K,R0,rms_px,n}
+    또는 None.
+    """
+    w, h = img_size
+    pts = [(np.asarray(p, float), np.asarray(X, float), fr)
+           for p, X, fr in landmarks if rel_rots.get(fr) is not None]
+    if len(pts) < 4:
+        return None
+    cam0 = np.asarray(cam_init, float)
+    # 초기 절대회전: 센터마크 응시
+    fwd = -cam0 / (np.linalg.norm(cam0) + 1e-9)
+    right = np.cross(fwd, [0, 0, 1.0]); right /= np.linalg.norm(right) + 1e-9
+    down = np.cross(fwd, right); down /= np.linalg.norm(down) + 1e-9
+    rv0, _ = cv2.Rodrigues(np.stack([right, down, fwd]))
+
+    def resid(prm):
+        cam, f = prm[:3], prm[3]
+        R0, _ = cv2.Rodrigues(prm[4:7])
+        K = make_K(f, w, h)
+        out = []
+        for p, X, fr in pts:
+            Ri = rel_rots[fr] @ R0
+            xc = Ri @ (np.array([X[0], X[1], 0.0]) - cam)
+            if xc[2] <= 1e-6:
+                out += [1e3, 1e3]; continue
+            u = K @ xc
+            out += [u[0] / u[2] - p[0], u[1] / u[2] - p[1]]
+        return np.array(out)
+
+    best = None
+    eps = np.array([0.1, 0.1, 0.1, 10.0, 1e-3, 1e-3, 1e-3])
+    for frac in f_init_fracs:
+        prm = np.concatenate([cam0, [frac * w], rv0.ravel()])
+        r = resid(prm); lam = 1e-3
+        for _ in range(iters):
+            J = np.stack([(resid(prm + eps[j] * np.eye(7)[j]) - r) / eps[j]
+                          for j in range(7)], axis=1)
+            try:
+                dp = np.linalg.solve(J.T @ J + lam * np.eye(7), -(J.T @ r))
+            except np.linalg.LinAlgError:
+                break
+            r2 = resid(prm + dp)
+            if np.sum(r2 ** 2) < np.sum(r ** 2):
+                prm, r, lam = prm + dp, r2, max(lam * 0.5, 1e-7)
+                if np.linalg.norm(dp[4:7]) < 1e-7 and abs(dp[3]) < 0.1:
+                    break
+            else:
+                lam *= 4
+        rms = float(np.sqrt(np.mean(r ** 2)))
+        if best is None or rms < best[1]:
+            best = (prm, rms)
+    prm, rms = best
+    R0, _ = cv2.Rodrigues(prm[4:7])
+    return {"cam_pos": prm[:3], "f": float(prm[3]),
+            "K": make_K(prm[3], w, h), "R0": R0,
+            "rms_px": rms, "n": len(pts)}

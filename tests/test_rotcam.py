@@ -217,3 +217,29 @@ def test_chain_homography_static_and_transfer(tmp_path):
     pts = np.array([[100.0, 60.0], [300.0, 200.0]])
     moved = transfer_points(H, pts)
     assert np.abs(moved - pts).max() < 2.0, moved
+
+
+def test_bundle_calibrate_pools_frames():
+    """다프레임 랜드마크를 상대회전으로 모아 f·설치 복원 (팬 퇴화 회피)."""
+    from pystitch.core.rotcam import bundle_calibrate
+    from pystitch.core.field import landmark_positions
+    pos = landmark_positions(105.0, 68.0)
+    keys = ["corner_far_l", "corner_far_r", "half_far", "half_near",
+            "circle_l", "circle_r", "pen_l_far", "pen_r_far"]
+    # 여러 팬 각도(프레임)에서 랜드마크 관측 — 상대회전은 GT 로 제공
+    R0, _t0, _K = gt_state(yaw_deg=0.0)
+    rel_rots, landmarks = {}, []
+    for fr, yaw in enumerate((-10, -4, 0, 6, 12)):
+        Rf, tf, Kf = gt_state(yaw_deg=yaw)
+        rel = Rf @ R0.T                          # 기준(yaw0)→이 프레임
+        rel_rots[fr] = rel
+        for k in keys:
+            uv = field_to_pixel(Kf, Rf, tf, [pos[k]])[0]
+            if np.all(np.isfinite(uv)) and 0 <= uv[0] < W and 0 <= uv[1] < H:
+                landmarks.append((uv, pos[k], fr))
+    cal = bundle_calibrate(rel_rots, landmarks, (W, H),
+                           np.array([0.0, 45.0, 6.0]))
+    assert cal is not None
+    assert abs(cal["f"] - F_TRUE) / F_TRUE < 0.03, cal["f"]
+    assert np.linalg.norm(cal["cam_pos"] - CAM) < 2.0, cal["cam_pos"]
+    assert cal["rms_px"] < 2.0
