@@ -617,3 +617,41 @@ def bundle_calibrate(rel_rots, landmarks, img_size, cam_init,
     return {"cam_pos": prm[:3], "f": float(prm[3]),
             "K": make_K(prm[3], w, h), "R0": R0,
             "rms_px": rms, "n": len(pts)}
+
+
+# ------------------------------------------------------------ 회전 평균
+def rotation_average(n, edges, R_init, iters=100, tol=1e-7):
+    """전역 회전 평균 (chordal L2, 반복) — 체인 드리프트를 전역 분산.
+
+    edges: [(i, j, R_ij)] — 규약 R_i ≈ R_ij @ R_j (world→cam 상대회전).
+    루프 클로저 엣지가 있어야 드리프트가 실제로 분산된다 (체인만이면
+    변화 없음). R_init: 초기 절대회전 리스트(체인/스패닝트리). 반환:
+    절대회전 리스트 (일부 노드는 엣지 없으면 R_init 유지).
+    """
+    R = [np.array(r, float) if r is not None else None for r in R_init]
+    nbr = [[] for _ in range(n)]
+    for i, j, Rij in edges:
+        nbr[i].append((j, Rij, False))         # R_i 추정 = Rij @ R_j
+        nbr[j].append((i, Rij, True))          # R_j 추정 = Rij^T @ R_i
+    for _ in range(iters):
+        maxupd = 0.0
+        for i in range(n):
+            if R[i] is None or not nbr[i]:
+                continue
+            ests = []
+            for j, Rij, inv in nbr[i]:
+                if R[j] is None:
+                    continue
+                ests.append((Rij.T @ R[j]) if inv else (Rij @ R[j]))
+            if not ests:
+                continue
+            M = sum(ests) / len(ests)
+            U, _s, Vt = np.linalg.svd(M)
+            d = np.sign(np.linalg.det(U @ Vt))
+            Rn = U @ np.diag([1.0, 1.0, d]) @ Vt
+            ang = np.arccos(np.clip((np.trace(Rn @ R[i].T) - 1) / 2, -1, 1))
+            maxupd = max(maxupd, ang)
+            R[i] = Rn
+        if maxupd < tol:
+            break
+    return R

@@ -243,3 +243,36 @@ def test_bundle_calibrate_pools_frames():
     assert abs(cal["f"] - F_TRUE) / F_TRUE < 0.03, cal["f"]
     assert np.linalg.norm(cal["cam_pos"] - CAM) < 2.0, cal["cam_pos"]
     assert cal["rms_px"] < 2.0
+
+
+def test_rotation_average_distributes_drift():
+    """드리프트 있는 체인 + 루프 클로저 → 회전 평균이 GT 로 수렴."""
+    from pystitch.core.rotcam import rotation_average
+    rng = np.random.default_rng(5)
+    n = 20
+    # GT 절대회전: 점진 yaw 팬 (world→cam)
+    def yaw_R(a):
+        c, s = np.cos(a), np.sin(a)
+        return np.array([[c, -s, 0], [s, c, 0], [0, 0, 1.0]])
+    Rgt = [yaw_R(np.deg2rad(i * 2.0)) for i in range(n)]
+    # 인접 엣지 R_ij = R_i R_j^T + 소음 (드리프트 유발)
+    edges = []
+    for i in range(1, n):
+        noise = yaw_R(np.deg2rad(rng.normal(0, 0.3)))
+        edges.append((i, i - 1, noise @ Rgt[i] @ Rgt[i - 1].T))
+    # 루프 클로저: 0 과 n-1 이 유사 시야는 아니지만, 몇몇 원거리 쌍의
+    # 정확한 상대회전을 추가 (재방문 흉내)
+    for a, b in [(0, 10), (5, 15), (0, 19), (3, 17)]:
+        edges.append((a, b, Rgt[a] @ Rgt[b].T))
+    # 초기: 체인 누적 (드리프트 포함)
+    Rinit = [Rgt[0].copy()]
+    for i in range(1, n):
+        e = next(e for e in edges if e[0] == i and e[1] == i - 1)
+        Rinit.append(e[2] @ Rinit[i - 1])
+    drift0 = np.rad2deg(np.arccos(np.clip(
+        (np.trace(Rinit[-1] @ Rgt[-1].T) - 1) / 2, -1, 1)))
+    Ravg = rotation_average(n, edges, Rinit)
+    drift1 = np.rad2deg(np.arccos(np.clip(
+        (np.trace(Ravg[-1] @ Rgt[-1].T) - 1) / 2, -1, 1)))
+    assert drift1 < drift0, (drift0, drift1)
+    assert drift1 < 1.0, drift1               # 루프로 드리프트 대폭 감소

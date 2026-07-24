@@ -26,7 +26,7 @@ from pystitch.core.field import (  # noqa: E402
     LINE_LANDMARKS, VLINE_LANDMARKS, landmark_positions,
 )
 from pystitch.core.rotcam import (  # noqa: E402
-    bundle_calibrate, decompose_H, make_K, match_frames,
+    bundle_calibrate, decompose_H, make_K, match_frames, rotation_average,
 )
 
 
@@ -63,12 +63,14 @@ def build_trajectory(cap, grid, det_w, log):
         return cv2.cvtColor(fr, cv2.COLOR_BGR2GRAY), sc
 
     BR = 8                                      # 브리지 최대 뒤로 스텝 수
-    recent = [gray(grid[0])]                    # 최근 그레이 (뒤로 BR 개)
+    all_gray = {}                               # {grid idx: (gray, scale)}
+    all_gray[0] = gray(grid[0])
+    recent = [all_gray[0]]                       # 최근 그레이 (뒤로 BR 개)
     Hcum = [np.eye(3)]
     n_ok = n_rep = 0
     t0 = time.perf_counter()
     for i in range(1, len(grid)):
-        cur = gray(grid[i])
+        cur = gray(grid[i]); all_gray[i] = cur
         H = _homography(recent[-1], cur)        # grid[i-1] → grid[i]
         if H is not None and Hcum[i - 1] is not None:
             n_ok += 1
@@ -92,7 +94,7 @@ def build_trajectory(cap, grid, det_w, log):
             recent.pop(0)
         if i % 60 == 0:
             log(f"  궤적 {i}/{len(grid)-1} ({(time.perf_counter()-t0):.0f}s)")
-    return Hcum, n_ok, n_rep
+    return Hcum, n_ok, n_rep, all_gray
 
 
 def main():
@@ -154,8 +156,10 @@ def main():
                 print(f"[rotcam] 궤적 캐시 재사용: {tcache.name}", flush=True)
         except Exception as e:  # noqa: BLE001
             print(f"[rotcam] 캐시 무시: {e}", flush=True)
+    all_gray = None
     if Hcum is None:
-        Hcum, n_ok, n_rep = build_trajectory(cap, grid, args.det_w, print)
+        Hcum, n_ok, n_rep, all_gray = build_trajectory(
+            cap, grid, args.det_w, print)
         arr = np.array([np.full((3, 3), np.nan) if h is None else h
                         for h in Hcum], np.float64)
         np.savez_compressed(tcache, Hcum=arr, step=step, det_w=args.det_w,
@@ -167,32 +171,70 @@ def main():
     if args.traj_only:
         print("[rotcam] --traj-only: 궤적 캐시만 생성하고 종료", flush=True)
         cap.release(); return
-
-    ref_i = len(grid) // 2                      # 기준 = 중앙 그리드
-    while ref_i < len(Hcum) and Hcum[ref_i] is None:
-        ref_i += 1
-    if ref_i >= len(Hcum):
-        sys.exit("유효한 기준 프레임 없음 — 궤적 전부 끊김")
-    Href_inv = np.linalg.inv(Hcum[ref_i])
-
-    def rel_rots(f):
-        """기준 그리드 대비 각 랜드마크 프레임 상대회전 {frame: R}."""
-        K = make_K(f, W, H)
-        out = {}
-        for k, _p, fr in lms:
-            gi = min(range(len(grid)), key=lambda i: abs(grid[i] - fr))
-            if Hcum[gi] is None:
-                out[fr] = None
+    if all_gray is None:                        # 캐시 재사용 시 그레이 재로딩
+        all_gray = {}
+        for i, gf in enumerate(grid):
+            if Hcum[i] is None:
                 continue
-            Hrel = Hcum[gi] @ Href_inv          # ref → gi
-            out[fr] = decompose_H(Hrel, K)[0]
-        return out
+            cap.set(cv2.CAP_PROP_POS_FRAMES, gf)
+            ok, fr = cap.read()
+            if not ok:
+                continue
+            sc = args.det_w / fr.shape[1] if fr.shape[1] > args.det_w else 1.0
+            if sc < 1.0:
+                fr = cv2.resize(fr, (args.det_w, int(fr.shape[0] * sc)),
+                                interpolation=cv2.INTER_AREA)
+            all_gray[i] = (cv2.cvtColor(fr, cv2.COLOR_BGR2GRAY), sc)
 
-    # f 초기값마다 상대회전 재계산하며 번들 (팬 퇴화 회피)
+    valid = [i for i in range(len(grid)) if Hcum[i] is not None]
+    ref_i = valid[len(valid) // 2]              # 기준 = 중앙 유효 그리드
+    Hri = np.linalg.inv(Hcum[ref_i])
+    # 인접 엣지 상대 호모그래피 (ref 기준 체인) — f 무관, 1회
+    Hchain_rel = {i: (Hcum[i] @ Hri) for i in valid}   # ref → i
+
+    # 루프 클로저 후보: f0 로 체인 절대회전 근사 → 시야 유사(먼 쌍)만
+    # 직접 SIFT. 한 번만 (f 후보마다 재계산 안 함).
+    f0 = 0.9 * W; K0 = make_K(f0, W, H)
+    Rch0 = {i: decompose_H(Hchain_rel[i], K0)[0] for i in valid}
+    yaw = {i: np.arctan2(Rch0[i][0, 2], Rch0[i][2, 2]) for i in valid}
+    loop_H = []                                 # (i, j, H_ji) 원본좌표
+    t0 = time.perf_counter()
+    for a in range(len(valid)):
+        i = valid[a]
+        for b in range(a + 8, len(valid)):
+            j = valid[b]
+            if abs(yaw[i] - yaw[j]) > np.deg2rad(6):
+                continue                        # 시야 다름 — 스킵
+            ang = np.rad2deg(np.arccos(np.clip(
+                (np.trace(Rch0[i] @ Rch0[j].T) - 1) / 2, -1, 1)))
+            if ang < 6.0:
+                Hd = _homography(all_gray.get(j), all_gray.get(i))
+                if Hd is not None:
+                    loop_H.append((i, j, Hd))
+    print(f"[rotcam] 루프 클로저 {len(loop_H)}개 검출 "
+          f"({time.perf_counter()-t0:.0f}s)", flush=True)
+
+    def averaged_rots(f):
+        K = make_K(f, W, H)
+        Rch = [None] * len(grid)
+        for i in valid:
+            Rch[i] = decompose_H(Hchain_rel[i], K)[0]
+        edges = []
+        for a, b in zip(valid, valid[1:]):      # 체인 엣지 (b 기준 a)
+            edges.append((b, a, decompose_H(Hcum[b] @ np.linalg.inv(Hcum[a]),
+                                            K)[0]))
+        for i, j, Hd in loop_H:                 # 루프 엣지 (i 기준 j)
+            edges.append((i, j, decompose_H(Hd, K)[0]))
+        return rotation_average(len(grid), edges, Rch)
+
     cam_init = np.array([0.0, size[1] / 2 + 12, 7.0])
     best = None
     for frac in (0.5, 0.7, 0.9, 1.1):
-        rr = rel_rots(frac * W)
+        Ravg = averaged_rots(frac * W)
+        rr = {}
+        for k, _p, fr in lms:
+            gi = min(valid, key=lambda i: abs(grid[i] - fr))
+            rr[fr] = Ravg[gi]
         landmarks = [(p, pos[k], fr) for k, p, fr in lms]
         cal = bundle_calibrate(rr, landmarks, (W, H), cam_init,
                                f_init_fracs=(frac,))
@@ -200,6 +242,7 @@ def main():
             best = cal
     if best is None:
         sys.exit("번들 실패 — 랜드마크/궤적 확인")
+    print(f"[rotcam] 루프 클로저 {len(loop_H)}개로 회전 평균", flush=True)
     cp = best["cam_pos"]
     fov = 2 * np.degrees(np.arctan(W / 2 / best["f"]))
     print(f"[rotcam] 번들: f {best['f']:.0f}px (f/W {best['f']/W:.2f}, "
@@ -214,21 +257,16 @@ def main():
     if warn:
         print("[rotcam] 경고: " + " / ".join(warn), flush=True)
 
-    # 사이드카: record-sec 간격 프레임별 자세 (rvec) + f
+    # 사이드카: 그리드별 자세 (rvec) + f — 회전평균 절대회전 사용
     K = best["K"]
-    rstep = max(1, int(args.record_sec * fps))
+    Ravg = averaged_rots(best["f"])             # 최적 f 로 평균 회전 재산출
+    Href_inv = Hri
     rec_frames, rvecs, fs = [], [], []
     for i, gf in enumerate(grid):
-        if Hcum[i] is None or gf % rstep >= step:
-            pass
-    # 그리드 자세를 record 간격으로 (그리드가 곧 자세 격자)
-    for i, gf in enumerate(grid):
-        if Hcum[i] is None:
+        if Hcum[i] is None or Ravg[i] is None:
             continue
-        Hrel = Hcum[i] @ Href_inv
-        R_rel = decompose_H(Hrel, K)[0]
-        ratio = decompose_H(Hrel, K)[1]
-        R_i = R_rel @ best["R0"]
+        R_i = Ravg[i] @ best["R0"]              # ref기준 → 절대(월드)
+        ratio = decompose_H(Hcum[i] @ Href_inv, K)[1]   # 줌비만
         rv, _ = cv2.Rodrigues(R_i)
         rec_frames.append(int(gf))
         rvecs.append([round(float(v), 6) for v in rv.ravel()])
