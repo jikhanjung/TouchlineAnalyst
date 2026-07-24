@@ -106,19 +106,30 @@ def build_trajectory(cap, grid, det_w, img_size, log):
         R0 = {i: decompose_H(Hcum[i] @ Hri, K0)[0] for i in valid}
         yaw = {i: np.arctan2(R0[i][0, 2], R0[i][2, 2]) for i in valid}
         t1 = time.perf_counter()
+        # 후보(유사 시야 먼 쌍)를 먼저 다 모으고, 상한(LOOP_MAX)까지
+        # 균등 샘플링해 SIFT — 팬 왕복이 많으면 후보가 O(n²)로 폭발하므로
+        # (SIFT 무제한 호출 방지). 회전 평균엔 골고루 퍼진 루프면 충분.
+        LOOP_MAX = 400
+        cand = []
         for a in range(len(valid)):
             i = valid[a]
             for b in range(a + 8, len(valid)):
                 j = valid[b]
-                if abs(yaw[i] - yaw[j]) > np.deg2rad(6):
+                if abs(yaw[i] - yaw[j]) > np.deg2rad(5):
                     continue
-                ang = np.rad2deg(np.arccos(np.clip(
-                    (np.trace(R0[i] @ R0[j].T) - 1) / 2, -1, 1)))
-                if ang < 6.0:
-                    Hd = _homography(all_gray.get(j), all_gray.get(i))
-                    if Hd is not None:
-                        loop.append((i, j, Hd))
-        log(f"  루프 클로저 {len(loop)}개 ({time.perf_counter()-t1:.0f}s)")
+                ang = (np.trace(R0[i] @ R0[j].T) - 1) / 2
+                if ang > np.cos(np.deg2rad(5)):     # <5° 시야차
+                    cand.append((b - a, i, j))      # 스팬 클수록 유용
+        cand.sort(reverse=True)                     # 긴 루프 우선
+        if len(cand) > LOOP_MAX:
+            idx = np.linspace(0, len(cand) - 1, LOOP_MAX).astype(int)
+            cand = [cand[k] for k in idx]
+        for _sp, i, j in cand:
+            Hd = _homography(all_gray.get(j), all_gray.get(i))
+            if Hd is not None:
+                loop.append((i, j, Hd))
+        log(f"  루프 클로저 {len(loop)}/{len(cand)}후보 "
+            f"({time.perf_counter()-t1:.0f}s)")
     return Hcum, n_ok, n_rep, loop
 
 
