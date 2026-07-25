@@ -2966,6 +2966,9 @@ class PtzTab(QWidget):
             [], [], [], None
         self.roles = {}
         self.field_points = {}
+        self.field_point_frames = {}
+        self.field_point_invalid = {}
+        self.field_lines = {}
         self.line_points = []
         self.extra_players = {}
         self.kit_colors = {}
@@ -6473,6 +6476,11 @@ class PtzTab(QWidget):
 
     def _field_remove_point(self, key):
         if self.field_points.pop(key, None) is not None:
+            # 그 키의 프레임/무효구간도 함께 제거 — 안 그러면 재지정 시
+            # 옛 프레임에서 이송/무효처리돼 엉뚱해진다.
+            self.field_point_frames.pop(key, None)
+            self.field_point_invalid.pop(key, None)
+            self._rc_pose_gen = getattr(self, "_rc_pose_gen", 0) + 1
             self._refit_field()
             self._save_keyframes()
             self._refresh_field_list()
@@ -6484,15 +6492,24 @@ class PtzTab(QWidget):
             self._field_remove_point(LANDMARKS[row][0])
 
     def _field_clear_all(self):
-        if not self.field_points:
+        if not (self.field_points or self.field_lines or self.line_points):
             return
+        n = len(self.field_points) + len(self.field_lines)
         if QMessageBox.question(
                 self, "랜드마크 전체 삭제",
-                f"찍은 랜드마크 {len(self.field_points)}개를 모두 "
+                f"찍은 랜드마크/라인점 {n}개를 모두 "
                 "삭제할까요?") != QMessageBox.StandardButton.Yes:
             return
+        # 완전 초기화 — field_points 만 비우고 frames/invalid/lines 를
+        # 남기면 클리어 후 재작업 시 이전 프레임/이전 라인점으로 이송돼
+        # 엉뚱해진다 (reset_edits('field') 와 동일 집합).
         self.field_points = {}
+        self.field_point_frames = {}
+        self.field_point_invalid = {}
+        self.field_lines = {}
         self.line_points = []
+        self._rc_pose_gen = getattr(self, "_rc_pose_gen", 0) + 1
+        self._rc_calib = None
         self._refit_field(log_result=True)
         self._save_keyframes()
         self._refresh_field_list()
