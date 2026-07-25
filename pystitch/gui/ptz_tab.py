@@ -4200,9 +4200,11 @@ class PtzTab(QWidget):
                         col = (150, 150, 150) if lost else (255, 255, 0)
                         tag = LANDMARK_TAGS[k] + ("~" if transferred else "")
                 else:
-                    stale = kf is not None and abs(kf - f) > self.fps
-                    col = (150, 150, 150) if stale else (255, 255, 0)
-                    tag = LANDMARK_TAGS[k] + (f"@{kf}" if stale else "")
+                    # 파노라마는 고정 뷰 — 어느 프레임에 찍었든 랜드마크
+                    # 위치가 동일하다. 프레임-스테일 색칠(회색/청록)은
+                    # rotcam 잔재라 혼란만 주므로 전부 동일하게 그린다.
+                    col = (255, 255, 0)
+                    tag = LANDMARK_TAGS[k]
                 cv2.drawMarker(frame, q, col,
                                cv2.MARKER_TILTED_CROSS,
                                max(14, int(36 * sc)), max(2, int(6 * sc)))
