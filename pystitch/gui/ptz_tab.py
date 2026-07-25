@@ -30,8 +30,8 @@ from PyQt6.QtWidgets import (
 
 from ..core.encoders import available_encoders
 from ..core.field import (
-    LANDMARKS, detect_sideline_points, field_outline, field_to_pano,
-    fit_field_calibration, landmark_positions, pano_to_field,
+    CENTER_CIRCLE_R, LANDMARKS, detect_sideline_points, field_outline,
+    field_to_pano, fit_field_calibration, landmark_positions, pano_to_field,
 )
 from ..core.ptz import (
     accept_ball_tracks, analyze_video, build_plan, build_radar_data,
@@ -48,6 +48,15 @@ TEAM_COLORS = [(60, 60, 230), (230, 140, 40), (160, 160, 160),
                (250, 150, 60)]
 ROLE_NAMES = ["팀1", "팀2", "기타", "팀1 GK", "팀2 GK", "주심", "선심"]
 ROLE_TAGS = {3: "GK1", 4: "GK2", 5: "REF", 6: "AR"}
+# 라인 point-to-line 캘리브(rotcam)용 — 값=(_marking_lines 패밀리 인덱스,
+# 표시명, 표시색 BGR). 터치라인 다점을 소실점 구속으로 f 를 안정화한다.
+LINE_FAMILIES = {
+    "touch_near": (0, "가까운 터치라인", (0, 220, 220)),
+    "touch_far": (1, "먼 터치라인", (0, 160, 255)),
+    "goal_l": (2, "왼쪽 골라인", (255, 200, 0)),
+    "goal_r": (3, "오른쪽 골라인", (255, 120, 0)),
+    "halfway": (4, "하프라인", (200, 100, 255)),
+}
 # 미리보기 오버레이용 랜드마크 약칭 (cv2 폰트는 한글 불가)
 LANDMARK_TAGS = {"corner_far_l": "FL", "corner_far_r": "FR",
                  "corner_near_l": "NL", "corner_near_r": "NR",
@@ -60,6 +69,37 @@ LANDMARK_TAGS = {"corner_far_l": "FL", "corner_far_r": "FR",
                  "pen_r_box_far": "BRF", "pen_r_box_near": "BRN",
                  "center_near": "CM",
                  "circle_l": "CL", "circle_r": "CR"}
+
+
+def _dashed_circle(img, center, radius, color, thickness=2, dash_deg=18):
+    """점선 원 — 무시된 공(=공 아님) 테두리용. dash_deg 간격으로 호를
+    번갈아 그린다 (OpenCV 는 점선 원을 직접 지원하지 않음)."""
+    radius = max(1, int(radius))
+    for a in range(0, 360, dash_deg * 2):
+        cv2.ellipse(img, center, (radius, radius), 0, a, a + dash_deg,
+                    color, thickness, cv2.LINE_AA)
+
+
+def _ffmpeg_frame(path, t, w, h, timeout=45.0):
+    """ffmpeg 빠른 시크로 프레임 하나를 원본 해상도(BGR)로 디코드.
+
+    OpenCV `set(POS_FRAMES)` 는 큰 프레임·긴 GOP(파노라마는 6540px,
+    ~8초 GOP)에서 키프레임부터 순차 디코드라 40분 지점이 수십 초 걸린다.
+    ffmpeg 는 `-ss` 를 입력 앞에 둬 키프레임으로 빠르게 시크한 뒤 정확
+    위치까지만 멀티스레드 디코드 — 같은 프레임이 ~2~3초로 끝난다."""
+    import subprocess
+    cmd = ["ffmpeg", "-v", "error", "-ss", f"{max(0.0, t):.6f}",
+           "-i", str(path), "-frames:v", "1",
+           "-f", "rawvideo", "-pix_fmt", "bgr24", "-"]
+    try:
+        p = subprocess.run(cmd, stdout=subprocess.PIPE,
+                           stderr=subprocess.DEVNULL, timeout=timeout)
+    except Exception:  # noqa: BLE001
+        return None
+    need = w * h * 3
+    if len(p.stdout) < need:
+        return None
+    return np.frombuffer(p.stdout[:need], np.uint8).reshape(h, w, 3)
 
 
 def _boost_bgr(bgr, s_gain=1.35, v_gain=1.55, v_floor=190):
@@ -94,7 +134,7 @@ class TimelineView(QWidget):
     LANE_H = 20                  # 기본 레인 높이 (개별 조절 가능)
     GUTTER = 64
     LANES = ["크롭/KF", "공", "뜬 공", "팀1", "팀2", "기타", "호각", "이벤트",
-             "하이라이트"]
+             "하이라이트", "랜드마크"]
     WHISTLE_MIN_DB = 20.0        # 이 피크 이상만 '확실한 호각'으로 표시
 
     def __init__(self):
@@ -140,6 +180,7 @@ class TimelineView(QWidget):
         self.mark_out = None         # 내보내기 끝 프레임
         self._whistle = None         # (hop_s, 프로미넌스 배열, 이벤트)
         self.events = []             # [(frame, label, kind)] kind: auto|user
+        self.landmarks = []          # [(frame, label, (b,g,r))] 랜드마크 찍은 프레임
         self.airborne = []           # [(f0, f1, apex_z)] 공중 구간
         self.highlights = []         # [(f0, f1, state, label)] 하이라이트 구간
         self.pauses = []             # [(f0, f1)] 경기 중단 (시계 정지) 구간
@@ -157,6 +198,12 @@ class TimelineView(QWidget):
 
     def set_events(self, events):
         self.events = list(events)
+        self.update()
+
+    def set_landmarks(self, marks):
+        """랜드마크 찍은 프레임 마커 [(frame, label, (b,g,r))] — 어느
+        프레임에 무엇을 찍었는지 한눈에, 클릭하면 그 프레임으로 이동."""
+        self.landmarks = list(marks or [])
         self.update()
 
     def set_airborne(self, segs):
@@ -225,9 +272,11 @@ class TimelineView(QWidget):
     def contextMenuEvent(self, ev):
         if self.total <= 1:
             return
-        x = int(ev.pos().x())
+        x, y = int(ev.pos().x()), int(ev.pos().y())
         f = int(min(max(self._f(max(x, self.GUTTER)), 0), self.total - 1))
-        self._menu_lane = self._lane_at(int(ev.pos().y()))
+        self._menu_lane = self._lane_at(y)
+        # 우클릭 지점의 트랙릿(선수/공) — 타임라인 레인에서 직접 병합/해제
+        self._menu_hit = self._hit(x, y) if y >= self.RULER else None
         self.range_menu.emit(f, ev.globalPos())
 
     # --------------------------------------------------------------- 데이터
@@ -650,6 +699,21 @@ class TimelineView(QWidget):
                     p.drawRect(x_ - 4, y + 1, 8, lh - 2)
                 p.drawText(QRect(x_ + 5, y, 140, lh),
                            Qt.AlignmentFlag.AlignVCenter, label)
+        # 랜드마크 레인: 찍은 프레임마다 색 틱 (+ 라벨 있으면 표기)
+        if self.landmarks and self.total > 1:
+            y, lh = self._lane_rect(9)
+            for i, (f_, label, col) in enumerate(self.landmarks):
+                x_ = self._x(f_)
+                if not (self.GUTTER - 4 <= x_ <= W + 4):
+                    continue
+                c = QColor(int(col[2]), int(col[1]), int(col[0]))
+                p.fillRect(x_ - 1, y + 2, 2, lh - 4, c)
+                p.setPen(c)
+                if self.selected == ("landmark", i):
+                    p.drawRect(x_ - 3, y + 1, 6, lh - 2)
+                if label:
+                    p.drawText(QRect(x_ + 4, y, 60, lh),
+                               Qt.AlignmentFlag.AlignVCenter, label)
         # 경기 중단 구간: 회색 세로 밴드 (시계 정지 — hydration break 등)
         if self.pauses and self.total > 1:
             for f0, f1 in self.pauses:
@@ -781,6 +845,13 @@ class TimelineView(QWidget):
             for i, (f0, f1, state, label) in enumerate(self.highlights):
                 if f0 <= f <= f1:
                     return ("hl", i)
+        if lane == 9:
+            best, bd = None, 10.0
+            for i, (f_, label, col) in enumerate(self.landmarks):
+                d = abs(self._x(f_) - x)
+                if d < bd:
+                    best, bd = ("landmark", i), d
+            return best
         return None
 
     def mousePressEvent(self, ev):
@@ -1170,6 +1241,55 @@ class PtzPlayWorker(QThread):
                 f += step
         finally:
             cap.release()
+
+
+class NativeFrameWorker(QThread):
+    """프록시 표시 직후 원본(파노라마) 해상도 프레임을 백그라운드로 읽어
+    교체용으로 넘긴다. 자체 디코더를 소유하고, 요청이 몰리면 **최신
+    프레임만** 처리한다 (스크럽 중 밀린 요청은 버림)."""
+
+    frame_ready = pyqtSignal(object, int)          # (BGR 원본, frame)
+
+    def __init__(self):
+        super().__init__()
+        from PyQt6.QtCore import QMutex, QWaitCondition
+        self._mx = QMutex()
+        self._cv = QWaitCondition()
+        self._req = None                           # (path, frame, t, w, h) 최신
+        self._stop = False
+
+    def request(self, path, frame, t, w, h):
+        self._mx.lock()
+        self._req = (str(path), int(frame), float(t), int(w), int(h))
+        self._cv.wakeAll()
+        self._mx.unlock()
+
+    def stop(self):
+        self._mx.lock()
+        self._stop = True
+        self._cv.wakeAll()
+        self._mx.unlock()
+        self.wait(3000)
+
+    def run(self):
+        while True:
+            self._mx.lock()
+            while self._req is None and not self._stop:
+                self._cv.wait(self._mx)
+            if self._stop:
+                self._mx.unlock()
+                break
+            path, frame, t, w, h = self._req
+            self._req = None
+            self._mx.unlock()
+            img = _ffmpeg_frame(path, t, w, h)     # 빠른 시크 (~2~3초)
+            # 디코드하는 사이 더 새 요청이 들어왔으면 이 결과는 버린다.
+            # 실패(img None)라도 방출 — GUI 가 대기 표시를 해제하게.
+            self._mx.lock()
+            stale = self._req is not None or self._stop
+            self._mx.unlock()
+            if not stale:
+                self.frame_ready.emit(img, frame)
 
 
 class PtzRenderWorker(QThread):
@@ -1660,18 +1780,35 @@ class PtzTab(QWidget):
         self.player_nums: dict[int, str] = {}  # {대표 tid: 등번호}
         self.rosters: dict[int, list] = {}     # {팀: ["7 이름", ...]} 명단
         self.hidden_players: set[int] = set()  # 숨긴 대표 tid (관중·오인식)
+        self._rb = None                   # 좌드래그 러버밴드 (사람 다중 선택)
+        self._pane_sel: set[int] = set()  # 러버밴드로 고른 대표 tid
         self.field_points: dict[str, list] = {}   # {랜드마크키: [x, y]}
         # 랜드마크를 찍은 프레임 {키: frame} — 팬 카메라(AX700)용: 프레임
         # 간 이송(rotcam)으로 기준 프레임에 합쳐 캘리브레이션한다.
         # 파노라마(고정 뷰)에선 정보로만 존재.
         self.field_point_frames: dict[str, int] = {}
+        # {랜드마크키: [[f0,f1], ...]} — 그 구간에선 이송이 엉뚱해 무효
+        # (원 프레임에선 유효, 특정 프레임대 이송만 제외). rotcam 전용.
+        self.field_point_invalid: dict[str, list] = {}
+        # {라인키: [[px,py,frame], ...]} — 터치라인 등 위의 다점 (point-to-
+        # line 캘리브). 소실점으로 f 를 안정화. rotcam 전용. LINE_FAMILIES.
+        self.field_lines: dict[str, list] = {}
+        self._Hcache = {}                 # (src,dst)→이송 H (open 시 재설정)
+        self._graycache = {}              # 프레임→det_w 그레이 (open 시 재설정)
+        self._lm_transferred = {}         # 현재 프레임 이송 랜드마크
+        self._rc_pose_gen = 0             # 프레임별 자세 캐시 무효화 키
         self.line_points: list[list] = []  # 흰 선 검출 샘플 [x, y] (사이드라인)
         self.field_size = [105.0, 68.0]   # 경기장 길이×폭 (m)
+        self.field_circle_r = CENTER_CIRCLE_R  # 센터서클 반지름(m) — 경기장별
+        self.field_circle_auto = True     # 중앙선 4점에서 R 자동 추정
         self._field_calib = None          # fit_field_calibration 결과
         self.extra_players: dict[int, list] = {}  # {샘플si: [[cx,cy,w,h,id]]}
         self._next_extra_id = 900001      # 수동 검출 ID (분석 ID와 분리)
         self._adhoc = None                # 주변 재검출용 YOLO 캐시
         self._native_cap = None           # 프록시 표시 중 원본 프레임용
+        self._cur_scale = 1.0             # 현재 _cur_frame 의 표시 스케일
+        self._native_worker = None        # 프록시→원본 백그라운드 승격
+        self._native_pending = None       # 원본 승격 대기 중인 프레임
         self.track_spans: list = []
         self._pcache_id = None            # 선수 요약 캐시 기준 분석 객체 id
         self._pcolors_id = None           # 대표색 캐시 키 (분석에만 의존)
@@ -1854,7 +1991,10 @@ class PtzTab(QWidget):
             # 숫자 1..9 = 카메라 선택 (멀티캠 경기 열려 있을 때, 같은 관례)
             digit = (self.match is not None
                      and Qt.Key.Key_1 <= k <= Qt.Key.Key_9)
-            if space or digit:
+            # Del = 선택된 사람 숨기기 (오인식/관중) — 영상 위 선택 있을 때
+            delsel = (k in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace)
+                      and bool(self._pane_sel))
+            if space or digit or delsel:
                 w = QApplication.widgetAt(QCursor.pos())
                 hot = (self.trackbar, self.slider, self.tl_scroll, self.pane,
                        self._pane_split)
@@ -1862,6 +2002,8 @@ class PtzTab(QWidget):
                     if w in hot:
                         if space:
                             self._toggle_play()
+                        elif delsel:
+                            self._sel_hide()
                         else:
                             self._mc_select(k - Qt.Key.Key_1)
                         return True
@@ -2184,8 +2326,35 @@ class PtzTab(QWidget):
         for sp in (self.spin_field_len, self.spin_field_w):
             sp.valueChanged.connect(self._field_size_changed)
             fr.addWidget(sp)
+        # 센터서클 반지름 — 경기장별로 다름 (유소년은 작음). 자동=중앙선
+        # 4점 교차비로 추정, 수동이면 값 고정.
+        self.spin_circle_r = QDoubleSpinBox()
+        self.spin_circle_r.setRange(3.0, 15.0)
+        self.spin_circle_r.setSingleStep(0.1)
+        self.spin_circle_r.setSuffix(" R")
+        self.spin_circle_r.setValue(self.field_circle_r)
+        self.spin_circle_r.setToolTip("센터서클 반지름(m) — 경기장별")
+        self.spin_circle_r.valueChanged.connect(self._circle_r_changed)
+        fr.addWidget(self.spin_circle_r)
+        self.chk_circle_auto = QCheckBox("R자동")
+        self.chk_circle_auto.setChecked(True)
+        self.chk_circle_auto.setToolTip("중앙선 4점(half·circle)으로 R 자동 추정")
+        self.chk_circle_auto.toggled.connect(self._circle_auto_toggled)
+        fr.addWidget(self.chk_circle_auto)
+        # venue 프리셋 (경기장 규격 기억)
+        fr.addWidget(QLabel("venue"))
+        self.combo_venue = QComboBox()
+        self.combo_venue.setMinimumWidth(120)
+        self.combo_venue.setToolTip("저장한 경기장 규격 불러오기")
+        self.combo_venue.activated.connect(self._apply_venue_idx)
+        fr.addWidget(self.combo_venue)
+        b = QPushButton("venue 저장")
+        b.setToolTip("현재 경기장 길이·폭·서클R 을 이름 붙여 저장")
+        b.clicked.connect(self._save_venue_dialog)
+        fr.addWidget(b)
         fr.addStretch(1)
         fl.addLayout(fr)
+        self._refresh_venue_combo()
 
         self.log_view = QPlainTextEdit()
         self.log_view.setReadOnly(True)
@@ -2806,6 +2975,8 @@ class PtzTab(QWidget):
         self.player_nums = {}
         self.rosters = {}
         self.hidden_players = set()
+        self._pane_sel = set()
+        self._rb = None
         self._ar_side_cache = {}
         sp = self._sidecar_path()
         doc = None
@@ -2827,6 +2998,12 @@ class PtzTab(QWidget):
             self.field_point_frames = {
                 k: int(f) for k, f in
                 (doc.get("field_point_frames") or {}).items()}
+            self.field_point_invalid = {
+                k: [[int(r[0]), int(r[1])] for r in rngs]
+                for k, rngs in (doc.get("field_point_invalid") or {}).items()}
+            self.field_lines = {
+                k: [[float(p[0]), float(p[1]), int(p[2])] for p in pts]
+                for k, pts in (doc.get("field_lines") or {}).items()}
             self.line_points = [list(p) for p in doc.get("line_points", [])]
             self.extra_players = {int(si): [list(p) for p in rows]
                                   for si, rows in
@@ -2855,6 +3032,15 @@ class PtzTab(QWidget):
             ids = [int(p[4]) for rows in self.extra_players.values()
                    for p in rows]
             self._next_extra_id = max(ids, default=900000) + 1
+            self.field_circle_r = float(doc.get("field_circle_r",
+                                                CENTER_CIRCLE_R))
+            self.field_circle_auto = bool(doc.get("field_circle_auto", True))
+            self.spin_circle_r.blockSignals(True)
+            self.spin_circle_r.setValue(self.field_circle_r)
+            self.spin_circle_r.blockSignals(False)
+            self.chk_circle_auto.blockSignals(True)
+            self.chk_circle_auto.setChecked(self.field_circle_auto)
+            self.chk_circle_auto.blockSignals(False)
             fs = doc.get("field_size")
             if fs:
                 self.field_size = [float(fs[0]), float(fs[1])]
@@ -2919,7 +3105,12 @@ class PtzTab(QWidget):
                                    "field_points": self.field_points,
                                    "field_point_frames":
                                        self.field_point_frames,
+                                   "field_point_invalid":
+                                       self.field_point_invalid,
+                                   "field_lines": self.field_lines,
                                    "field_size": self.field_size,
+                                   "field_circle_r": self.field_circle_r,
+                                   "field_circle_auto": self.field_circle_auto,
                                    "line_points": self.line_points,
                                    "extra_players": self.extra_players,
                                    "kit_colors": self.kit_colors,
@@ -3158,10 +3349,17 @@ class PtzTab(QWidget):
         if self._audio:
             self._audio.pause()
 
+    def closeEvent(self, ev):
+        if self._native_worker is not None:
+            self._native_worker.stop()
+            self._native_worker = None
+        super().closeEvent(ev)
+
     def _play_frame(self, frame, f, disp_scale=1.0):
         self._cur_frame, self._cur_frame_idx = frame, f
         # 재생 중 표시 스케일 — _redraw 가 오버레이 좌표에 반영
         self._play_scale = self.disp_scale * disp_scale
+        self._cur_scale = self._play_scale   # 정지 후 리드로 대비 일관성
         if self.mc is not None:
             self.mc.update(f / self.fps, playing=True)
             self.mc.primary_tick(frame, playing=True)
@@ -3471,10 +3669,16 @@ class PtzTab(QWidget):
         return None
 
     def _landmark_at(self, x, y, r=60.0):
-        """(x, y) 근처의 찍힌 랜드마크 키 (반경 r px, 없으면 None)."""
+        """(x, y) 근처의 랜드마크 키 (반경 r px, 없으면 None).
+
+        rotcam 모드에선 마커가 이송 위치에 그려지므로 이송 위치로 매칭
+        (엉뚱하게 이송된 마커를 우클릭·드래그로 집을 수 있게)."""
         best, bestd = None, r * r
+        rc = getattr(self, "_is_rotcam", False)
+        tr = getattr(self, "_lm_transferred", {})
         for k, p in self.field_points.items():
-            d = (p[0] - x) ** 2 + (p[1] - y) ** 2
+            q = (tr.get(k) if rc else None) or p
+            d = (q[0] - x) ** 2 + (q[1] - y) ** 2
             if d <= bestd:
                 best, bestd = k, d
         return best
@@ -3494,12 +3698,17 @@ class PtzTab(QWidget):
                 return
         if self.btn_field_pick.isChecked():   # 찍기 모드: 박스 편집 비활성
             return
-        if self.plan is None or self.analysis is None:
+        if self.analysis is None:
             return
         if self._hit(x, y) is not None:      # 공/키프레임이 우선 (클릭 동작)
             return
-        hit = self._box_hit(x, y)
+        hit = self._box_hit(x, y) if self.plan is not None else None
         if hit is None or self._plan_box is None:
+            # 빈 곳(또는 크롭 박스 밖) 좌드래그 = 사람 다중 선택 러버밴드.
+            # Shift = 기존 선택에 추가(합집합), 없으면 새 선택.
+            shift = bool(QApplication.keyboardModifiers()
+                         & Qt.KeyboardModifier.ShiftModifier)
+            self._rb = {"x0": x, "y0": y, "x1": x, "y1": y, "shift": shift}
             return
         x0, y0, w, h = self._plan_box
         box = [x0 + w / 2, y0 + h / 2, float(w)]
@@ -3516,12 +3725,19 @@ class PtzTab(QWidget):
     def _pane_dragged(self, fx, fy):
         if self.mc is not None and self.mc.alt_on_main:
             return                        # 전환 모드: alt 표시 중 편집 입력 차단
-        if self._lm_drag is not None:        # 랜드마크 이동 — 라이브 재피팅
-            self.field_points[self._lm_drag] = \
-                [round(fx * self.pano_w, 1), round(fy * self.pano_h, 1)]
+        if self._rb is not None:             # 러버밴드 확장 중
+            self._rb["x1"] = fx * self.pano_w
+            self._rb["y1"] = fy * self.pano_h
+            self._redraw()
+            return
+        if self._lm_drag is not None:        # 랜드마크 이동 (미세조정)
+            nx = round(fx * self.pano_w, 1)
+            ny = round(fy * self.pano_h, 1)
+            self.field_points[self._lm_drag] = [nx, ny]
             self.field_point_frames[self._lm_drag] = int(self.slider.value())
-            self._refit_field()
-            self._refresh_field_list()
+            # 라이브 마커만 이동 — 무거운 재피팅은 놓을 때(_pane_released).
+            # 매 픽셀 재캘리브레이션은 미세조정을 렉걸리게 했다.
+            self._lm_transferred[self._lm_drag] = (nx, ny)
             self._redraw()
             return
         e = self._box_edit
@@ -3557,6 +3773,21 @@ class PtzTab(QWidget):
     def _pane_released(self, fx, fy):
         if self.mc is not None and self.mc.alt_on_main:
             return                        # 전환 모드: alt 표시 중 편집 입력 차단
+        if self._rb is not None:
+            rb, self._rb = self._rb, None
+            x1, x2 = sorted((rb["x0"], rb.get("x1", rb["x0"])))
+            y1, y2 = sorted((rb["y0"], rb.get("y1", rb["y0"])))
+            if (x2 - x1) < 6 or (y2 - y1) < 6:   # 사실상 클릭
+                if not rb.get("shift"):          # shift 없으면 선택 해제
+                    self._pane_sel = set()
+            else:
+                hits = self._players_in_rect(x1, y1, x2, y2)
+                self._pane_sel = (self._pane_sel | hits if rb.get("shift")
+                                  else hits)
+                self._sync_list_to_pane_sel()
+                self.log(f"[ptz] 드래그 선택: 선수 {len(self._pane_sel)}명")
+            self._redraw()
+            return
         if self._lm_drag is not None:
             key, self._lm_drag = self._lm_drag, None
             self._refit_field(log_result=True)
@@ -3601,6 +3832,7 @@ class PtzTab(QWidget):
         if not ok:
             return
         self._cur_frame, self._cur_frame_idx = frame, f
+        self._cur_scale = self.disp_scale
         if self.mc is not None:
             self.mc.update(f / self.fps, playing=False)
             self.mc.primary_tick(frame)
@@ -3608,6 +3840,38 @@ class PtzTab(QWidget):
         if getattr(self, "_is_rotcam", False) and self.field_points:
             with self._wait():            # 랜드마크 이송(호모그래피)은 무거움
                 self._rc_transfer_landmarks()
+        self._redraw()
+        # 프록시로 즉시 표시했으니, 원본(파노라마) 해상도를 백그라운드로
+        # 읽어 교체 (스크럽은 프록시로 빠르게, 멈추면 선명한 원본으로).
+        if self.disp_scale < 1.0 and self.mc is None:
+            self._request_native(f)
+
+    def _request_native(self, f):
+        if self.pano_path is None:
+            return
+        if self._native_worker is None:
+            self._native_worker = NativeFrameWorker()
+            self._native_worker.frame_ready.connect(self._native_frame_ready)
+            self._native_worker.start()
+        self._native_pending = int(f)
+        self._native_worker.request(self.pano_path, f, f / max(self.fps, 1e-9),
+                                    self.pano_w, self.pano_h)
+
+    def _native_frame_ready(self, frame, f):
+        """백그라운드 원본 프레임 도착 — 아직 그 프레임이면 선명하게 교체.
+        frame 이 None 이면 디코드 실패 — 대기 표시만 해제하고 SCRUB 유지."""
+        was_pending = getattr(self, "_native_pending", None) == f
+        if was_pending:
+            self._native_pending = None
+        if self._playing or self.slider.value() != f \
+                or getattr(self, "_cur_frame_idx", -1) != f:
+            return
+        if frame is None:
+            if was_pending:
+                self.log("[ptz] 원본 프레임 읽기 실패/시간초과 — SCRUB 유지")
+                self._redraw()            # 배지 loading→SCRUB
+            return
+        self._cur_frame, self._cur_scale = frame, 1.0
         self._redraw()
 
     def _redraw(self):
@@ -3626,7 +3890,7 @@ class PtzTab(QWidget):
         # 재생 중엔 다운스케일된 재생 프레임 → 그 스케일로 오버레이 좌표
         sc = (self._play_scale if self._playing
               and getattr(self, "_play_scale", None) is not None
-              else self.disp_scale)
+              else self._cur_scale)
         # 랜드마크 찍기 모드: 크롭 박스/공/키프레임/선수 오버레이 숨김 —
         # 경기장 선·마커만 보이게 해서 클릭 대상이 헷갈리지 않게 한다.
         picking = self.btn_field_pick.isChecked()
@@ -3694,13 +3958,10 @@ class PtzTab(QWidget):
             p = (int(bx * sc), int(by * sc))
             st = self._cand_state(f, si, bx, by)
             if st == "ignored":
-                cv2.circle(frame, p, rad, (60, 60, 200), 4)
-                cv2.line(frame, (p[0] - 24, p[1] - 24), (p[0] + 24, p[1] + 24),
-                         (60, 60, 200), 6)
-                cv2.line(frame, (p[0] - 24, p[1] + 24), (p[0] + 24, p[1] - 24),
-                         (60, 60, 200), 6)
-                cv2.putText(frame, "IGNORED", (p[0] + 36, p[1] + 10),
-                            cv2.FONT_HERSHEY_SIMPLEX, 1.4, (60, 60, 200), 4)
+                # 공이 아님 = 회색 점선 테두리만 (글씨 없이). 세부 사유는
+                # 커서 올리면 툴팁으로 (_pane_tooltip).
+                _dashed_circle(frame, p, rad + max(3, int(6 * sc)),
+                               (150, 150, 150), max(1, int(2 * sc)))
             elif st == "promoted":
                 cv2.circle(frame, p, rad, (200, 0, 255), 6)
             elif st == "accepted":
@@ -3753,6 +4014,13 @@ class PtzTab(QWidget):
                     y2 = int((pp[1] + pp[3] / 2) * sc)
                     cv2.rectangle(frame, (x1, y1), (x2, y2), color,
                                   max(1, int(2 * sc)))
+                    if pid is not None and pid >= 0 \
+                            and self._rep(pid) in self._pane_sel:
+                        # 드래그 다중 선택: 청록 이중 테두리
+                        g = max(3, int(5 * sc))
+                        cv2.rectangle(frame, (x1 - g, y1 - g),
+                                      (x2 + g, y2 + g), (255, 255, 0),
+                                      max(2, int(3 * sc)))
                     if pid is not None and sel_rep is not None \
                             and pid >= 0 and self._rep(pid) == sel_rep:
                         # 선택된 트랙릿(병합 그룹 포함): 빨간 박스 + 이중 테두리
@@ -3774,6 +4042,27 @@ class PtzTab(QWidget):
                                     cv2.FONT_HERSHEY_SIMPLEX,
                                     max(0.5, 1.1 * sc), color,
                                     max(1, int(3 * sc)))
+                # 무시(숨긴) 사람도 회색 점선 박스로 — 누구를 숨겼는지 보이고
+                # 우클릭 복원 가능 (_players_row 는 제외하므로 raw 에서 별도로)
+                if self.hidden_players:
+                    raw = (list(self.analysis["players"][si])
+                           + self.extra_players.get(int(si), []))
+                    for pp in raw:
+                        if len(pp) < 5 or pp[4] < 0:
+                            continue
+                        if self._rep(int(pp[4])) not in self.hidden_players:
+                            continue
+                        x1 = int((pp[0] - pp[2] / 2) * sc)
+                        y1 = int((pp[1] - pp[3] / 2) * sc)
+                        x2 = int((pp[0] + pp[2] / 2) * sc)
+                        y2 = int((pp[1] + pp[3] / 2) * sc)
+                        gc = (110, 110, 110)
+                        cv2.rectangle(frame, (x1, y1), (x2, y2), gc,
+                                      max(1, int(1 * sc)))
+                        cv2.putText(frame, "X",
+                                    (x1, y1 - max(3, int(6 * sc))),
+                                    cv2.FONT_HERSHEY_SIMPLEX,
+                                    max(0.4, 0.8 * sc), gc, max(1, int(2 * sc)))
             ball_g = None
             # 레이더 공 = 수락 트랙 기준 — 원시 검출을 쓰면 무시한
             # 오인식 공이 미니맵에 계속 공으로 남는다
@@ -3835,7 +4124,8 @@ class PtzTab(QWidget):
                 if pose is not None:
                     Kc, Rc = pose["K"], pose["R"]
                     tc = -Rc @ np.asarray(rc["cam_pos"])
-                    lines_iter = field_outline(*self.field_size)
+                    lines_iter = field_outline(*self.field_size,
+                                               circle_r=self.field_circle_r)
                 else:
                     lines_iter = []           # 자세 못 풀면 라인 안 그림
                 for line in lines_iter:
@@ -3855,7 +4145,8 @@ class PtzTab(QWidget):
                                           (60, 220, 255), max(1, int(2 * sc)))
                         seg = []
             elif self._field_calib is not None:
-                for line in field_outline(*self.field_size):
+                for line in field_outline(*self.field_size,
+                                          circle_r=self.field_circle_r):
                     q = field_to_pano(self._field_calib, line)
                     seg = []
                     for qx, qy in list(q) + [(np.nan, np.nan)]:
@@ -3886,9 +4177,15 @@ class PtzTab(QWidget):
                 px = tp if tp is not None else pt
                 q = (int(px[0] * sc), int(px[1] * sc))
                 if rotcam:
-                    lost = kf is not None and int(kf) != int(f) and tp is None
-                    col = (150, 150, 150) if lost else (255, 255, 0)
-                    tag = LANDMARK_TAGS[k] + ("~" if transferred else "")
+                    invalid = self._lm_invalid_here(k, f)
+                    lost = (kf is not None and int(kf) != int(f)
+                            and tp is None and not invalid)
+                    if invalid:                    # 이 프레임 수동 무효 (주황 X)
+                        col = (0, 140, 255)
+                        tag = LANDMARK_TAGS[k] + " X"
+                    else:
+                        col = (150, 150, 150) if lost else (255, 255, 0)
+                        tag = LANDMARK_TAGS[k] + ("~" if transferred else "")
                 else:
                     stale = kf is not None and abs(kf - f) > self.fps
                     col = (150, 150, 150) if stale else (255, 255, 0)
@@ -3900,6 +4197,50 @@ class PtzTab(QWidget):
                             (q[0] + 12, q[1] - 12), cv2.FONT_HERSHEY_SIMPLEX,
                             max(0.5, 1.0 * sc), col,
                             max(1, int(3 * sc)))
+            # 라인 점(터치라인 등) — 패밀리 색 작은 점 (rotcam 이송 반영)
+            for key, pts in self.field_lines.items():
+                lcol = LINE_FAMILIES[key][2]
+                for lx, ly, lfr in pts:
+                    q2 = (lx, ly)
+                    if rotcam and int(lfr) != int(f):
+                        H = self._rc_H(int(lfr), int(f))
+                        if H is None:
+                            continue
+                        from ..core.rotcam import transfer_points
+                        q2 = transfer_points(H, [[lx, ly]])[0]
+                    cv2.circle(frame, (int(q2[0] * sc), int(q2[1] * sc)),
+                               max(3, int(7 * sc)), lcol, -1)
+                    cv2.circle(frame, (int(q2[0] * sc), int(q2[1] * sc)),
+                               max(3, int(7 * sc)), (30, 30, 30),
+                               max(1, int(2 * sc)))
+        # 러버밴드 사각형 (드래그 다중 선택 중)
+        if self._rb is not None and "x1" in self._rb:
+            rx1, rx2 = sorted((self._rb["x0"], self._rb["x1"]))
+            ry1, ry2 = sorted((self._rb["y0"], self._rb["y1"]))
+            cv2.rectangle(frame, (int(rx1 * sc), int(ry1 * sc)),
+                          (int(rx2 * sc), int(ry2 * sc)),
+                          (255, 255, 0), max(1, int(2 * sc)))
+        # 좌하단 소스 배지: 원본(풀해상도) vs 스크럽 프록시 (OpenCV 한글
+        # 미지원 → ASCII). 프록시 표시 직후 백그라운드 승격되면 ORIG 로 바뀜.
+        if getattr(self, "_cur_frame", None) is not None:
+            bh, bw = frame.shape[:2]
+            is_orig = getattr(self, "_cur_scale", 1.0) >= 1.0
+            loading = (not is_orig
+                       and getattr(self, "_native_pending", None)
+                       == getattr(self, "_cur_frame_idx", -1))
+            txt = ("ORIG" if is_orig
+                   else "SCRUB -> ORIG..." if loading else "SCRUB")
+            col = (0, 220, 0) if is_orig else (0, 170, 255)
+            fs = max(0.5, bw / 1920.0 * 0.9)
+            th = max(1, int(bw / 1920.0 * 2))
+            (tw, tht), bl = cv2.getTextSize(txt, cv2.FONT_HERSHEY_SIMPLEX,
+                                            fs, th)
+            m = max(6, int(bw * 0.006))
+            x0, y0 = m, bh - m
+            cv2.rectangle(frame, (x0 - 4, y0 - tht - bl - 4),
+                          (x0 + tw + 4, y0 + 4), (0, 0, 0), -1)
+            cv2.putText(frame, txt, (x0, y0 - bl),
+                        cv2.FONT_HERSHEY_SIMPLEX, fs, col, th, cv2.LINE_AA)
         self.pane.set_frame(frame)
 
     # ------------------------------------------------------ 화면 오브젝트 조작
@@ -3925,6 +4266,14 @@ class PtzTab(QWidget):
             return
         o = self._hit(x, y)
         if o is None:
+            # 사람 위 클릭 = 선택 (드래그 러버밴드와 같은 _pane_sel 공유).
+            # Shift = 추가/삭제 토글, 없으면 그 사람만 선택.
+            tid = self._player_at(x, y)
+            if tid is not None:
+                shift = bool(QApplication.keyboardModifiers()
+                             & Qt.KeyboardModifier.ShiftModifier)
+                self._toggle_pane_sel(tid, shift)
+                return
             if self._box_hit(x, y) is not None:
                 return                      # 박스 테두리 클릭 = 드래그 미수 — 무동작
             # 빈 곳 = 모드에 따라 수동 공(기본) 또는 크롭 키프레임 추가
@@ -3957,6 +4306,27 @@ class PtzTab(QWidget):
         x, y = fx * self.pano_w, fy * self.pano_h
         o = self._hit(x, y)
         menu = QMenu(self)
+
+        # 드래그로 여러 명 선택돼 있으면 전원 대상 액션을 맨 위에
+        if self._pane_sel:
+            n = len(self._pane_sel)
+            sub = menu.addMenu(f"선택 {n}명 — 역할/팀 지정")
+            for r in (0, 1, 5, 6, 3, 4):
+                sub.addAction(self._role_name(r),
+                              lambda _=False, rr=r: self._sel_apply_role(rr))
+            sub.addSeparator()
+            sub.addAction("자동 분류로 되돌리기",
+                          lambda _=False: self._sel_apply_role(None))
+            if n >= 2:
+                menu.addAction(f"선택 {n}명 병합 (같은 사람)",
+                               lambda _=False: self._merge_tracklets(
+                                   sorted(self._pane_sel)))
+            menu.addAction(f"선택 {n}명 숨기기 (관중·오인식)",
+                           lambda _=False: self._sel_hide())
+            menu.addAction("선택 해제",
+                           lambda _=False: (setattr(self, "_pane_sel", set()),
+                                            self._redraw()))
+            menu.addSeparator()
 
         def _add_kf_here():
             w = (float(self.plan["crop_w"][int(f)])
@@ -3999,36 +4369,44 @@ class PtzTab(QWidget):
             menu.addAction("여기 수동 공 추가",
                            lambda: self._add_keyframe(f, x, y))
         tid = self._player_at(x, y)
-        if tid is None and self._injected_person_at(x, y):
+        hid = self._hidden_player_at(x, y) if tid is None else None
+        if hid is not None:
+            menu.addSeparator()
+            menu.addAction(f"#{hid} 복원 (숨김 해제)",
+                           lambda _=False, r=hid: self._unhide_one(r))
+        if tid is None and hid is None and self._injected_person_at(x, y):
             menu.addSeparator()
             a = menu.addAction("ID 없는 주입 검출 (갭필) — 역할을 붙이려면 "
                                "\"이 주변 사람 재검출\"로 ID 부여")
             a.setEnabled(False)
         if tid is not None:
             menu.addSeparator()
-            sub = menu.addMenu(
-                f"선수 #{tid} ({self._disp_role(tid, self._role_of(tid))}) "
-                "역할 지정")
+            hdr = menu.addAction(
+                f"선수 #{tid} — {self._disp_role(tid, self._role_of(tid))}")
+            hdr.setEnabled(False)
+            # 최상위에 펼침: 팀1 → 팀1 번호들, 팀2 → 팀2 번호들 (서브메뉴 X)
             for r in (0, 1):
-                sub.addAction(self._role_name(r),
-                              lambda _=False, rr=r, t=tid: self._set_role(t, rr))
-                self._add_num_items(sub, tid, r)
-            for r in (5, 6):
-                sub.addAction(self._role_name(r),
-                              lambda _=False, rr=r, t=tid:
-                              self._set_role(t, rr))
-            sub.addSeparator()                    # GK 는 드묾 — 아래쪽
-            for r in (3, 4):
-                sub.addAction(self._role_name(r),
-                              lambda _=False, rr=r, t=tid: self._set_role(t, rr))
-            sub.addSeparator()
-            sub.addAction("이 사람 숨기기 — 선수/심판 아님 (관중·오인식)",
-                          lambda _=False, t=tid: self._hide_player(t))
+                menu.addSeparator()
+                menu.addAction(self._role_name(r),
+                               lambda _=False, rr=r, t=tid:
+                               self._set_role(t, rr))
+                self._add_num_items(menu, tid, r)   # 그 팀 번호들 바로 밑
+            menu.addSeparator()
+            # 심판·선심·GK 는 덜 흔하므로 작은 서브메뉴로
+            osub = menu.addMenu("기타 역할 (심판·선심·GK)")
+            for r in (5, 6, 3, 4):
+                osub.addAction(self._role_name(r),
+                               lambda _=False, rr=r, t=tid:
+                               self._set_role(t, rr))
             if tid in self.roles:
-                sub.addAction("자동 분류로 되돌리기",
-                              lambda _=False, t=tid: self._set_role(t, None))
+                osub.addSeparator()
+                osub.addAction("자동 분류로 되돌리기",
+                               lambda _=False, t=tid: self._set_role(t, None))
+            # 오인식 무시 (최상위, 직접)
+            menu.addAction("오인식 무시 — 이 사람 숨기기 (선수/심판 아님)",
+                           lambda _=False, t=tid: self._hide_player(t))
             if tid >= 900001:
-                sub.addSeparator()
+                menu.addSeparator()
                 row = next((p for si_ in self.extra_players
                             for p in self.extra_players[si_]
                             if p[4] == tid), None)
@@ -4037,12 +4415,12 @@ class PtzTab(QWidget):
                                    if any(p[4] == tid for p in
                                           self.extra_players[si_]))
                     f_seed = int(self.analysis["frames"][si_seed])
-                    sub.addAction("앞뒤로 추적 확장 (±4s)",
-                                  lambda _=False, ff=f_seed, rr=row, t=tid:
-                                  self._propagate(ff, rr[0], rr[1],
-                                                  "person", ctx=t))
-                sub.addAction("이 수동 검출 삭제",
-                              lambda _=False, t=tid: self._delete_extra(t))
+                    menu.addAction("앞뒤로 추적 확장 (±4s)",
+                                   lambda _=False, ff=f_seed, rr=row, t=tid:
+                                   self._propagate(ff, rr[0], rr[1],
+                                                   "person", ctx=t))
+                menu.addAction("이 수동 검출 삭제",
+                               lambda _=False, t=tid: self._delete_extra(t))
         if self.analysis is not None and self._current_sample() is not None:
             menu.addSeparator()
             menu.addAction("이 주변 사람 재검출",
@@ -4056,6 +4434,23 @@ class PtzTab(QWidget):
                 sub.addAction(f"[{LANDMARK_TAGS[key]}] {mark}{name}{cur}",
                               lambda _=False, kk=key:
                               self._field_set_point(kk, x, y))
+            # 라인 위 다점 (터치라인 등) — point-to-line 캘리브로 f 안정화
+            subl = menu.addMenu("이 점을 라인에 추가 (다점 → f 안정화)")
+            for key, (fam, name, col) in LINE_FAMILIES.items():
+                n = len(self.field_lines.get(key, []))
+                subl.addAction(f"{name}" + (f" ({n}점)" if n else ""),
+                               lambda _=False, kk=key: self._line_add_point(
+                                   kk, x, y))
+            lp = self._line_point_at(x, y, r=40.0)
+            if lp is not None:
+                menu.addAction(
+                    f"라인 점 삭제 [{LINE_FAMILIES[lp[0]][1]}]",
+                    lambda _=False, kk=lp[0], ii=lp[1]:
+                    self._line_del_point(kk, ii))
+            for key in list(self.field_lines):
+                menu.addAction(f"{LINE_FAMILIES[key][1]} 점 전체 삭제 "
+                               f"({len(self.field_lines[key])}개)",
+                               lambda _=False, kk=key: self._line_clear(kk))
             near = self._landmark_at(x, y, r=100.0)
             if near is not None:
                 near_name = next(n for k, n, _ in LANDMARKS if k == near)
@@ -4072,6 +4467,38 @@ class PtzTab(QWidget):
                 menu.addAction(f"마커 [{LANDMARK_TAGS[near]}] 지정 해제",
                                lambda _=False, kk=near:
                                self._field_remove_point(kk))
+            # rotcam: 다른 프레임에서 이송된 마커가 여기서 엉뚱하면
+            # "이 프레임(구간) 이송 무효" 지정 — 원 프레임에선 유효 유지
+            if near is not None and getattr(self, "_is_rotcam", False):
+                f = int(getattr(self, "_cur_frame_idx", self.slider.value()))
+                kf = self.field_point_frames.get(near)
+                tag = LANDMARK_TAGS[near]
+                if not (kf is None or int(kf) == f):    # 이송된 마커만
+                    menu.addSeparator()
+                    win = int(round(3.0 * self.fps))
+                    if self._lm_invalid_here(near, f):
+                        menu.addAction(
+                            f"[{tag}] 이 프레임 이송 무효 해제",
+                            lambda _=False, kk=near, ff=f:
+                            self._lm_remove_invalid_at(kk, ff))
+                    else:
+                        menu.addAction(
+                            f"[{tag}] 이 부근 이송 무효 (±3초)",
+                            lambda _=False, kk=near, a=f - win, b=f + win:
+                            self._lm_add_invalid(kk, a, b))
+                        menu.addAction(
+                            f"[{tag}] 여기부터 끝까지 이송 무효",
+                            lambda _=False, kk=near, a=f:
+                            self._lm_add_invalid(kk, a, self.total - 1))
+                        menu.addAction(
+                            f"[{tag}] 처음부터 여기까지 이송 무효",
+                            lambda _=False, kk=near, b=f:
+                            self._lm_add_invalid(kk, 0, b))
+                    if self.field_point_invalid.get(near):
+                        menu.addAction(
+                            f"[{tag}] 이송 무효 구간 전체 해제",
+                            lambda _=False, kk=near:
+                            self._lm_clear_invalid(kk))
         menu.exec(gpos)
 
     def _pane_hover(self, fx, fy):
@@ -4102,6 +4529,15 @@ class PtzTab(QWidget):
                        else Qt.CursorShape.SizeBDiagCursor)
             self.pane.setCursor(cur)
             self._redraw()
+        # 무시된 공(=공 아님)에 커서를 올리면 사유를 툴팁으로
+        from PyQt6.QtWidgets import QToolTip
+        from PyQt6.QtGui import QCursor
+        if o is not None and o.get("kind") == "ball" \
+                and o.get("state") == "ignored":
+            QToolTip.showText(QCursor.pos(),
+                              "무시됨 — 이 물체는 공이 아님", self.pane)
+        else:
+            QToolTip.hideText()
 
     def _refresh_lists(self):
         """위: 공(자동 트랙+수동 키프레임) / 아래: 오인식(무시 구간)."""
@@ -4496,8 +4932,18 @@ class PtzTab(QWidget):
         self._save_keyframes()
         self._refresh_team_label()
         self._refresh_player_list()
+        self._plan_dirty()
         self._redraw()
         self.log(f"[ptz] 숨긴 사람 {n}명 복원")
+
+    def _unhide_one(self, rep):
+        self.hidden_players.discard(int(rep))
+        self._save_keyframes()
+        self._refresh_team_label()
+        self._refresh_player_list()
+        self._plan_dirty()
+        self._redraw()
+        self.log(f"[ptz] #{rep} 복원 (숨김 해제)")
 
     # ------------------------------------------------------ 등번호
     def _num_of(self, tid):
@@ -4526,9 +4972,11 @@ class PtzTab(QWidget):
     def _set_player_num(self, tid, team, num):
         """등번호 지정 — 번호는 팀 소속을 함의하므로 역할도 맞춘다.
 
-        같은 팀에 같은 번호가 이미 있으면: 동시 등장(같은 프레임)이면
-        물리적으로 다른 사람이므로 거부, 동시 등장이 없으면 같은
-        사람일 가능성이 높으므로 병합을 제안한다.
+        같은 팀에 같은 번호가 이미 있으면:
+        - 동시 등장(같은 프레임) = 물리적으로 다른 사람 → **방금 지정한
+          쪽이 우선**, 기존 소유자에게서 번호를 회수한다 (사용자 방향:
+          수동 지정이 최우선). 오탐/뒤바뀐 배정을 클릭 한 번으로 교정.
+        - 동시 등장 없음 = 같은 사람 → 자동 병합.
         """
         rep = self._rep(tid)
         num = str(num)
@@ -4538,25 +4986,23 @@ class PtzTab(QWidget):
         if other is not None and self.analysis is not None:
             co = self._cooccur_samples(rep, other)
             if co > 2:                        # 검출 지터 여유
-                QMessageBox.warning(
-                    self, "등번호 충돌",
-                    f"{self.team_names[team]} {num}번은 이미 #{other} 에 "
-                    f"지정돼 있고, 두 트랙릿이 같은 프레임에 {co}회 동시 "
-                    "등장합니다 — 같은 팀 같은 번호가 두 명일 수는 "
-                    "없습니다.\n한쪽 번호나 팀 분류를 확인하세요.")
-                return
-            r = QMessageBox.question(
-                self, "같은 번호 — 같은 사람?",
-                f"{self.team_names[team]} {num}번은 이미 #{other} 에 "
-                "지정돼 있습니다. 두 트랙릿은 동시 등장이 없어 같은 "
-                f"사람으로 보입니다 — #{rep} 을 #{other} 그룹에 "
-                "병합할까요?",
-                QMessageBox.StandardButton.Yes
-                | QMessageBox.StandardButton.No)
-            if r == QMessageBox.StandardButton.Yes:
+                # 다른 사람인데 번호 충돌 — 수동 지정 우선. 회수는 최소한:
+                # 그 번호를 실제로 보유한 '한' 키만 지운다 (병합 그룹의
+                # 다른 트랙릿 번호나 병합 자체는 건드리지 않음).
+                owner = next((k for k, v in self.player_nums.items()
+                              if v == num and self._rep(k) == other
+                              and self._role_of(k) in (team, team + 3)), None)
+                if owner is not None:
+                    self.player_nums.pop(owner, None)
+                self.log(f"[ptz] {self.team_names[team]} {num}번 회수: "
+                         f"#{other} → #{rep} (수동 지정 우선, 동시 {co}회)")
+            else:
+                # 동시 등장이 없으면 같은 사람 — 묻지 않고 바로 병합.
+                # (해제는 선수 목록에서 그룹 우클릭 → 병합 해제)
                 self.merges[rep] = other
                 self._merges_changed()
-                self.log(f"[ptz] #{rep} → #{other} 병합 (등번호 {num} 동일)")
+                self.log(f"[ptz] #{rep} → #{other} 자동 병합 "
+                         f"(등번호 {num} 동일)")
                 return
         self.player_nums[rep] = num
         if self._role_of(rep) not in (team, team + 3):   # GK 는 유지
@@ -5418,6 +5864,8 @@ class PtzTab(QWidget):
         if scope in ("field", "all"):
             self.field_points = {}
             self.field_point_frames = {}
+            self.field_point_invalid = {}
+            self.field_lines = {}
             self.line_points = []
         if self.analysis is not None:
             self._teams = classify_teams(self.analysis, roles=self.roles,
@@ -5458,6 +5906,38 @@ class PtzTab(QWidget):
 
     def _timeline_menu(self, f, gpos):
         menu = QMenu(self)
+        # 선수 레인에서 트랙릿 우클릭 → 그 선수 전용 메뉴만 (병합/분리/해체).
+        # 내보내기/이벤트/하이라이트 등 일반 타임라인 메뉴는 띄우지 않는다.
+        hit = getattr(self.trackbar, "_menu_hit", None)
+        if hit is not None and hit[0] == "player":
+            tid = int(hit[1])
+            rep = self._rep(tid)
+            self.trackbar.selected = hit          # 빨간 테두리 = 우클릭 대상
+            self.trackbar.update()
+            role = self._role_of(tid)
+            menu.addAction(f"#{tid} — {self._disp_role(tid, role)}"
+                           + (f"  {self._num_of(tid)}번"
+                              if self._num_of(tid) else "")).setEnabled(False)
+            menu.addSeparator()
+            sel = getattr(self, "_tl_pair_sel", None)
+            if sel is not None and sel != tid and self._rep(sel) != rep:
+                snum = self._num_of(sel)
+                menu.addAction(
+                    f"#{sel}" + (f" ({snum}번)" if snum else "")
+                    + f" 과(와) 병합 (같은 사람)",
+                    lambda _=False, a=sel, b=tid: self._tl_merge_pair(a, b))
+            menu.addAction("이 트랙릿을 병합 대상으로 선택",
+                           lambda _=False, t=tid: self._tl_mark_pair(t))
+            group = [t for t in self._pspans if self._rep(t) == rep]
+            if tid != rep:
+                menu.addAction(f"#{tid} 그룹에서 분리 (원래 분류로)",
+                               lambda _=False, t=tid: self._split_tracklet(t))
+            if len(group) > 1:
+                menu.addAction(
+                    f"그룹 해체 — #{rep} 외 {len(group) - 1}개 전부 분리",
+                    lambda _=False, r=rep: self._dissolve_group(r))
+            menu.exec(gpos)
+            return
         lane = getattr(self.trackbar, "_menu_lane", -1)
         if 0 <= lane < len(self.trackbar.LANES):
             name = self.trackbar.lanes[lane]
@@ -5685,6 +6165,11 @@ class PtzTab(QWidget):
             if 0 <= key < len(self.highlights):
                 self.slider.setValue(
                     int(self.highlights[key]["t0"] * self.fps))
+        elif kind == "landmark":
+            lm = self.trackbar.landmarks
+            if 0 <= key < len(lm):
+                self.trackbar.set_selection("landmark", key)
+                self.slider.setValue(int(lm[key][0]))
 
     def _assign_selected_role(self, role):
         rows = getattr(self, "_player_rows", [])
@@ -5840,6 +6325,15 @@ class PtzTab(QWidget):
                            self._unhide_players)
         if not menu.isEmpty():
             menu.exec(self.player_list.mapToGlobal(pos))
+
+    def _tl_mark_pair(self, tid):
+        """타임라인에서 병합 대상 1개를 찍어둔다 (다음 우클릭에서 짝지음)."""
+        self._tl_pair_sel = int(tid)
+        self.log(f"[merge] #{tid} 병합 대상 선택 — 다른 트랙릿 우클릭으로 병합")
+
+    def _tl_merge_pair(self, a, b):
+        self._tl_pair_sel = None
+        self._merge_tracklets([int(a), int(b)])
 
     def _merge_tracklets(self, tids):
         """선택 트랙릿 수동 병합 — 기존 그룹과 union (빠진 조각 추가 포함)."""
@@ -6023,7 +6517,118 @@ class PtzTab(QWidget):
         self._save_keyframes()
         self._redraw()
 
+    def _circle_r_changed(self, v):
+        # 사용자가 직접 만지면 수동 모드로 (자동 추정 끔)
+        if self.chk_circle_auto.isChecked():
+            self.chk_circle_auto.blockSignals(True)
+            self.chk_circle_auto.setChecked(False)
+            self.chk_circle_auto.blockSignals(False)
+            self.field_circle_auto = False
+        self.field_circle_r = float(v)
+        self._refit_field()
+        self._save_keyframes()
+        self._redraw()
+
+    def _circle_auto_toggled(self, on):
+        self.field_circle_auto = bool(on)
+        if on:                            # 켜면 즉시 재추정
+            self._refit_field()
+            self.spin_circle_r.blockSignals(True)
+            self.spin_circle_r.setValue(self.field_circle_r)
+            self.spin_circle_r.blockSignals(False)
+        self._save_keyframes()
+        self._redraw()
+
+    # ------------------------------------------------- venue 프리셋 (경기장 규격)
+    def _venues_path(self):
+        from pathlib import Path
+        return Path(__file__).resolve().parent.parent.parent \
+            / "presets" / "venues.json"
+
+    def _load_venues(self):
+        p = self._venues_path()
+        if not p.exists():
+            return {}
+        try:
+            return json.loads(p.read_text(encoding="utf-8"))
+        except Exception:  # noqa: BLE001
+            return {}
+
+    def _refresh_venue_combo(self):
+        self.combo_venue.blockSignals(True)
+        self.combo_venue.clear()
+        self.combo_venue.addItem("— venue 선택 —")
+        for name in sorted(self._load_venues()):
+            self.combo_venue.addItem(name)
+        self.combo_venue.blockSignals(False)
+
+    def _apply_venue_idx(self, idx):
+        if idx <= 0:
+            return
+        name = self.combo_venue.itemText(idx)
+        v = self._load_venues().get(name)
+        if not v:
+            return
+        self.field_size = [float(v["length"]), float(v["width"])]
+        self.field_circle_r = float(v.get("circle_r", CENTER_CIRCLE_R))
+        self.field_circle_auto = False
+        for sp, val in ((self.spin_field_len, self.field_size[0]),
+                        (self.spin_field_w, self.field_size[1]),
+                        (self.spin_circle_r, self.field_circle_r)):
+            sp.blockSignals(True)
+            sp.setValue(val)
+            sp.blockSignals(False)
+        self.chk_circle_auto.blockSignals(True)
+        self.chk_circle_auto.setChecked(False)
+        self.chk_circle_auto.blockSignals(False)
+        self._refit_field()
+        self._save_keyframes()
+        self._redraw()
+        self.log(f"[field] venue '{name}' 적용: {self.field_size[0]}×"
+                 f"{self.field_size[1]}m, 서클R {self.field_circle_r}m")
+
+    def _save_venue_dialog(self):
+        from PyQt6.QtWidgets import QInputDialog
+        name, ok = QInputDialog.getText(
+            self, "venue 저장",
+            f"경기장 이름 ({self.field_size[0]:.0f}×{self.field_size[1]:.0f}m, "
+            f"서클R {self.field_circle_r}m):")
+        if not ok or not name.strip():
+            return
+        name = name.strip()
+        venues = self._load_venues()
+        venues[name] = {"length": self.field_size[0],
+                        "width": self.field_size[1],
+                        "circle_r": self.field_circle_r}
+        p = self._venues_path()
+        try:
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(json.dumps(venues, ensure_ascii=False, indent=1),
+                         encoding="utf-8")
+        except Exception as e:  # noqa: BLE001
+            self.log(f"[field] venue 저장 실패: {e}")
+            return
+        self._refresh_venue_combo()
+        i = self.combo_venue.findText(name)
+        if i >= 0:
+            self.combo_venue.setCurrentIndex(i)
+        self.log(f"[field] venue '{name}' 저장 → {p.name}")
+
+    def _refresh_landmark_lane(self):
+        """찍은 랜드마크(점+라인) → 타임라인 랜드마크 레인 마커."""
+        marks = []
+        for k, fr in self.field_point_frames.items():
+            if k in self.field_points:
+                marks.append((int(fr), LANDMARK_TAGS.get(k, k[:3]),
+                              (0, 255, 255)))
+        for key, pts in self.field_lines.items():
+            col = LINE_FAMILIES[key][2]
+            for _lx, _ly, fr in pts:
+                marks.append((int(fr), "", col))
+        self.trackbar.set_landmarks(marks)
+
     def _refresh_field_list(self):
+        self._refresh_landmark_lane()
         row = self.field_list.currentRow()
         self.field_list.clear()
         for i, (key, name, req) in enumerate(LANDMARKS):
@@ -6074,6 +6679,58 @@ class PtzTab(QWidget):
         self._redraw()
         self.log(f"[field] 흰 선 샘플 {n}개 제거 — 랜드마크만으로 재피팅")
 
+    def _lm_pos_at(self, k, ref):
+        """랜드마크 k 를 프레임 ref 로 이송한 위치 (파노라마면 원위치)."""
+        if k not in self.field_points:
+            return None
+        p = self.field_points[k]
+        if not getattr(self, "_is_rotcam", False):
+            return np.array(p, float)
+        src = self.field_point_frames.get(k)
+        if src is None or int(src) == int(ref):
+            return np.array(p, float)
+        H = self._rc_H(int(src), int(ref))
+        if H is None:
+            return None
+        from ..core.rotcam import transfer_points
+        return np.array(transfer_points(H, [p])[0], float)
+
+    def _estimate_circle_r(self):
+        """중앙선 위 4점(half_far/near, circle_far/near)의 사영 교차비로
+        센터서클 반지름 R 을 역산 (경기장별로 R 이 다름 — 유소년은 작음).
+
+        네 점은 월드에서 (0, +hw), (0, +R), (0, -R), (0, -hw) 로 한 직선
+        위에 있고, 교차비는 사영 불변이라 이미지에서 R 을 닫힌형으로 푼다:
+          CR = (hw+R)² / (4·hw·R)  →  R = hw·(k − √(k²−1)), k = 2·CR−1.
+        4점이 없거나 퇴화면 None."""
+        need = ["half_far", "circle_far", "circle_near", "half_near"]
+        if not all(k in self.field_points for k in need):
+            return None
+        ref = (int(self.field_point_frames.get("circle_far",
+                                               self.slider.value()))
+               if getattr(self, "_is_rotcam", False) else 0)
+        P = [self._lm_pos_at(k, ref) for k in need]
+        if any(p is None for p in P):
+            return None
+        P = np.array(P)
+        c = P.mean(0)
+        u, s, vt = np.linalg.svd(P - c)
+        t = (P - c) @ vt[0]                 # 직선 위 1D 좌표
+        a, b, cc, dd = t
+        den = (a - dd) * (b - cc)
+        if abs(den) < 1e-9:
+            return None
+        cr = ((a - cc) * (b - dd)) / den
+        hw = self.field_size[1] / 2.0
+        k = 2.0 * cr - 1.0
+        disc = k * k - 1.0
+        if disc <= 0:
+            return None
+        R = hw * (k - np.sqrt(disc))        # (0, hw) 근
+        if not (0.5 < R < hw - 0.5):
+            return None
+        return float(R)
+
     def _refit_field_rotcam(self):
         """회전 카메라 필드 캘리브레이션 — 여러 프레임의 랜드마크를 기준
         프레임으로 이송해 합치고 원근 모델(rotcam) 피팅 (P06-3).
@@ -6083,8 +6740,21 @@ class PtzTab(QWidget):
         별도 단계(P06 대칭 판별)."""
         from ..core.field import LINE_LANDMARKS, VLINE_LANDMARKS, \
             landmark_positions
-        from ..core.rotcam import calibrate_reference, transfer_points
-        pos = landmark_positions(self.field_size[0], self.field_size[1])
+        from ..core.rotcam import (calibrate_reference,
+                                   calibrate_reference_lines, transfer_points)
+        # 센터서클 반지름 자동 추정 (중앙선 4점 있으면) — 경기장별 R
+        if self.field_circle_auto:
+            r = self._estimate_circle_r()
+            if r is not None and abs(r - self.field_circle_r) > 0.05:
+                self.field_circle_r = round(r, 2)
+                if hasattr(self, "spin_circle_r"):
+                    self.spin_circle_r.blockSignals(True)
+                    self.spin_circle_r.setValue(self.field_circle_r)
+                    self.spin_circle_r.blockSignals(False)
+                self.log(f"[field] 센터서클 반지름 자동 추정: "
+                         f"R = {self.field_circle_r}m (교차비)")
+        pos = landmark_positions(self.field_size[0], self.field_size[1],
+                                 circle_r=self.field_circle_r)
         usable = [(k, self.field_points[k], self.field_point_frames.get(k))
                   for k in self.field_points
                   if k not in LINE_LANDMARKS and k not in VLINE_LANDMARKS
@@ -6100,6 +6770,8 @@ class PtzTab(QWidget):
         for k, p, f in usable:
             src = int(f) if f is not None else ref
             if src != ref:
+                if self._lm_invalid_here(k, ref):   # 기준 프레임 이송 무효
+                    continue
                 H = self._rc_H(src, ref)
                 if H is None:
                     skipped += 1
@@ -6110,7 +6782,22 @@ class PtzTab(QWidget):
         if len(px) < 4:
             self._rc_skip = skipped
             return
-        cal = calibrate_reference(px, fld, (self.pano_w, self.pano_h))
+        # 라인 점(터치라인 등) → 기준 프레임 이송 + 패밀리 (point-to-line)
+        line_px, line_fam = [], []
+        for key, pts in self.field_lines.items():
+            fam = LINE_FAMILIES[key][0]
+            for lx, ly, lfr in pts:
+                p = [float(lx), float(ly)]
+                if int(lfr) != ref:
+                    H = self._rc_H(int(lfr), ref)
+                    if H is None:
+                        continue
+                    p = [float(v) for v in transfer_points(H, [p])[0]]
+                line_px.append(p)
+                line_fam.append(fam)
+        cal = calibrate_reference_lines(
+            px, fld, line_px, line_fam, (self.pano_w, self.pano_h),
+            length=self.field_size[0], width=self.field_size[1])
         if cal is not None:
             cal["ref_frame"] = ref
             self._rc_calib = cal
@@ -6192,6 +6879,27 @@ class PtzTab(QWidget):
         return [p for p in rows
                 if len(p) < 5 or p[4] < 0
                 or self._rep(int(p[4])) not in self.hidden_players]
+
+    def _hidden_player_at(self, x, y):
+        """(x, y) 아래 '숨긴' 사람의 대표 tid (없으면 None) — 회색 박스 복원용."""
+        si = self._current_sample()
+        if self.analysis is None or si is None or not self.hidden_players:
+            return None
+        raw = (list(self.analysis["players"][si])
+               + self.extra_players.get(int(si), []))
+        best, bestd = None, None
+        for p in raw:
+            if len(p) < 5 or p[4] < 0:
+                continue
+            rep = self._rep(int(p[4]))
+            if rep not in self.hidden_players:
+                continue
+            if (abs(x - p[0]) <= p[2] / 2 + 10
+                    and abs(y - p[1]) <= p[3] / 2 + 10):
+                d = (x - p[0]) ** 2 + (y - p[1]) ** 2
+                if best is None or d < bestd:
+                    best, bestd = rep, d
+        return best
 
     def _person_px_height(self, x, y):
         """(x, y) 지점에 선 사람(1.8m)의 예상 픽셀 키 — 캘리브레이션 기준.
@@ -6304,6 +7012,8 @@ class PtzTab(QWidget):
         for k, pt in self.field_points.items():
             if k in LINE_LANDMARKS or k in VLINE_LANDMARKS or k not in pos:
                 continue
+            if self._lm_invalid_here(k, cur):     # 이 프레임 이송 무효
+                continue
             kf = self.field_point_frames.get(k)
             if kf is None or int(kf) == cur:
                 p = pt
@@ -6323,14 +7033,113 @@ class PtzTab(QWidget):
         cache[cur] = got
         return got
 
+    def _line_add_point(self, key, x, y):
+        """터치라인 등 라인 위 점 추가 (다점 → point-to-line 캘리브)."""
+        self.field_lines.setdefault(key, []).append(
+            [round(float(x), 1), round(float(y), 1),
+             int(getattr(self, "_cur_frame_idx", self.slider.value()))])
+        n = len(self.field_lines[key])
+        self._save_keyframes()
+        self._refit_field(log_result=True)
+        self._refresh_field_list()
+        self._redraw()
+        self.log(f"[field] {LINE_FAMILIES[key][1]} 점 추가 ({n}개)")
+
+    def _line_clear(self, key):
+        if self.field_lines.pop(key, None) is not None:
+            self._save_keyframes()
+            self._refit_field()
+            self._refresh_field_list()
+            self._redraw()
+            self.log(f"[field] {LINE_FAMILIES[key][1]} 점 전체 삭제")
+
+    def _line_point_at(self, x, y, r=40.0):
+        """근처 라인 점 (key, index) — rotcam 이송 위치 기준 (삭제용)."""
+        best, bestd = None, r * r
+        rc = getattr(self, "_is_rotcam", False)
+        cur = int(getattr(self, "_cur_frame_idx", self.slider.value()))
+        for key, pts in self.field_lines.items():
+            for i, (px, py, fr) in enumerate(pts):
+                q = (px, py)
+                if rc and int(fr) != cur:
+                    H = self._rc_H(int(fr), cur)
+                    if H is None:
+                        continue
+                    from ..core.rotcam import transfer_points
+                    q = transfer_points(H, [[px, py]])[0]
+                d = (q[0] - x) ** 2 + (q[1] - y) ** 2
+                if d <= bestd:
+                    best, bestd = (key, i), d
+        return best
+
+    def _line_del_point(self, key, i):
+        pts = self.field_lines.get(key, [])
+        if 0 <= i < len(pts):
+            pts.pop(i)
+            if not pts:
+                self.field_lines.pop(key, None)
+            self._save_keyframes()
+            self._refit_field()
+            self._refresh_field_list()
+            self._redraw()
+
+    def _lm_invalid_here(self, k, f=None):
+        """랜드마크 k 가 프레임 f 에서 (이송이 엉뚱해) 무효로 표시됐는가."""
+        if f is None:
+            f = int(getattr(self, "_cur_frame_idx", self.slider.value()))
+        for a, b in self.field_point_invalid.get(k, ()):
+            if a <= f <= b:
+                return True
+        return False
+
+    def _lm_add_invalid(self, k, f0, f1):
+        """랜드마크 k 의 무효 구간 [f0,f1] 추가 (겹치면 병합)."""
+        rngs = list(self.field_point_invalid.get(k, []))
+        rngs.append([int(max(0, f0)), int(min(self.total - 1, f1))])
+        rngs.sort()
+        merged = []
+        for a, b in rngs:
+            if merged and a <= merged[-1][1] + 1:
+                merged[-1][1] = max(merged[-1][1], b)
+            else:
+                merged.append([a, b])
+        self.field_point_invalid[k] = merged
+        self._lm_invalid_changed()
+
+    def _lm_clear_invalid(self, k):
+        if self.field_point_invalid.pop(k, None) is not None:
+            self._lm_invalid_changed()
+
+    def _lm_remove_invalid_at(self, k, f):
+        """프레임 f 를 덮는 무효 구간만 제거 (나머지 구간은 유지)."""
+        rngs = [r for r in self.field_point_invalid.get(k, [])
+                if not (r[0] <= f <= r[1])]
+        if rngs:
+            self.field_point_invalid[k] = rngs
+        elif self.field_point_invalid.pop(k, None) is None:
+            return
+        self._lm_invalid_changed()
+
+    def _lm_invalid_changed(self):
+        """무효 구간 변경 → 프레임별 자세 캐시 무효화 + 재이송·재피팅·리드로."""
+        self._rc_pose_gen = getattr(self, "_rc_pose_gen", 0) + 1
+        self._save_keyframes()
+        self._rc_transfer_landmarks()
+        self._refit_field(log_result=True)
+        self._refresh_field_list()
+        self._redraw()
+
     def _rc_transfer_landmarks(self):
         """찍은 랜드마크를 현재 프레임으로 이송 → _lm_transferred.
-        회전 카메라에서 팬을 따라 랜드마크가 움직이도록 (사용자 요청)."""
+        회전 카메라에서 팬을 따라 랜드마크가 움직이도록 (사용자 요청).
+        이 프레임에서 무효로 표시된 랜드마크는 이송하지 않는다."""
         self._lm_transferred = {}
         if not getattr(self, "_is_rotcam", False):
             return
         cur = int(getattr(self, "_cur_frame_idx", self.slider.value()))
         for k, pt in self.field_points.items():
+            if self._lm_invalid_here(k, cur):
+                continue                      # 이 프레임 이송 무효 — 건너뜀
             src = self.field_point_frames.get(k)
             if src is None or int(src) == cur:
                 self._lm_transferred[k] = (pt[0], pt[1])
@@ -6343,10 +7152,18 @@ class PtzTab(QWidget):
 
     def _native_frame(self, f):
         """프레임 f 의 원본 해상도 이미지 (프록시 표시 중이면 원본을 읽음)."""
-        if self.disp_scale >= 1.0 and getattr(self, "_cur_frame_idx", -1) == f \
+        # 이미 원본 해상도로 표시 중인 그 프레임이면 재디코드 없이 재사용
+        # (원본 열기든 백그라운드 승격이든 _cur_scale 이 1.0 이면 원본).
+        if getattr(self, "_cur_scale", 1.0) >= 1.0 \
+                and getattr(self, "_cur_frame_idx", -1) == f \
                 and getattr(self, "_cur_frame", None) is not None:
             return self._cur_frame
-        if self._native_cap is None:
+        # ffmpeg 빠른 시크 (긴 GOP·큰 프레임에서 OpenCV 시크는 수십 초)
+        img = _ffmpeg_frame(self.pano_path, f / max(self.fps, 1e-9),
+                            self.pano_w, self.pano_h)
+        if img is not None:
+            return img
+        if self._native_cap is None:                # ffmpeg 실패 시 폴백
             self._native_cap = cv2.VideoCapture(str(self.pano_path))
         self._native_cap.set(cv2.CAP_PROP_POS_FRAMES, f)
         ok, frame = self._native_cap.read()
@@ -6532,6 +7349,79 @@ class PtzTab(QWidget):
                 if best is None or d < bestd:
                     best, bestd = int(p[4]), d
         return best
+
+    def _sel_apply_role(self, role):
+        """러버밴드 선택 전원에게 역할/팀 지정 (None = 자동 분류로)."""
+        for rep in list(self._pane_sel):
+            self._maybe_clear_num(
+                rep, role if role is not None else self._teams.get(rep, 2))
+            if role is None:
+                self.roles.pop(rep, None)
+            else:
+                self.roles[rep] = role
+        if self._pane_sel:
+            self.log(f"[ptz] 선택 {len(self._pane_sel)}명 → "
+                     + (self._role_name(role) if role is not None else "자동"))
+            self._roles_changed()
+
+    def _sel_hide(self):
+        for rep in list(self._pane_sel):
+            self.hidden_players.add(rep)
+        n = len(self._pane_sel)
+        self._pane_sel = set()
+        self._save_keyframes()
+        self._refresh_team_label()
+        self._refresh_player_list()
+        self._plan_dirty()                # 크롭 계획 재계산 (숨긴 사람 제외)
+        self._redraw()
+        self.log(f"[ptz] 선택 {n}명 숨김")
+
+    def _players_in_rect(self, x1, y1, x2, y2):
+        """사각형(파노라마 px) 안에 중심이 든 선수들의 대표 tid 집합."""
+        si = self._current_sample()
+        out: set[int] = set()
+        if self.analysis is None or si is None:
+            return out
+        for p in self._players_row(si):
+            if len(p) < 5 or p[4] < 0:
+                continue
+            if x1 <= p[0] <= x2 and y1 <= p[1] <= y2:
+                out.add(self._rep(int(p[4])))
+        return out
+
+    def _toggle_pane_sel(self, tid, shift):
+        """사람 클릭 선택 — shift=추가/삭제 토글, 아니면 그 사람만."""
+        rep = self._rep(int(tid))
+        if shift:
+            if rep in self._pane_sel:
+                self._pane_sel.discard(rep)
+            else:
+                self._pane_sel.add(rep)
+        else:
+            self._pane_sel = {rep}
+        self._sync_list_to_pane_sel()
+        self.log(f"[ptz] 선택 {len(self._pane_sel)}명")
+        self._redraw()
+
+    def _sync_list_to_pane_sel(self):
+        """팬 러버밴드 선택 → 선수 목록 선택도 맞춤 (목록 우클릭 메뉴 재사용)."""
+        rows = getattr(self, "_player_rows", [])
+        if not rows:
+            return
+        sm = self.player_list.selectionModel()
+        if sm is None:
+            return
+        from PyQt6.QtCore import QItemSelection, QItemSelectionModel
+        self.player_list.clearSelection()
+        first = None
+        for r, tid in enumerate(rows):
+            if self._rep(tid) in self._pane_sel:
+                idx = self.player_list.model().index(r, 0)
+                sm.select(idx, QItemSelectionModel.SelectionFlag.Select)
+                if first is None:
+                    first = idx
+        if first is not None:
+            self.player_list.scrollTo(first)
 
     def _recompute_tracks(self):
         """수락 트랙 구간 재계산 → 트랙바 갱신 (분석/무시 구간 변경 시).

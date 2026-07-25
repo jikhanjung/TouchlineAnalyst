@@ -77,6 +77,51 @@ def calibrate_reference(px_pts, field_pts, img_size, f_frac=(0.4, 3.0),
             "img_size": (int(w), int(h))}
 
 
+def calibrate_reference_lines(px_pts, field_pts, line_px, line_fam, img_size,
+                              length=105.0, width=68.0, min_points=6):
+    """점 랜드마크(완전 X,Y) + 라인 점(터치라인 등)을 함께 쓴 캘리브.
+
+    점만으론 시야가 좁을 때 초점거리 f 가 준퇴화(팬 퇴화)한다. 평행한
+    근/원 터치라인은 소실점을 통해 f 를 강하게 잡아준다. 절차:
+      (1) 점으로 calibrate_reference → cam_pos·초기 (f, R)
+      (2) cam_pos 고정, 라인 점 point-to-line 으로 (f, R) 정밀화
+          (_refine_pose_p2l) — 라인이 소실점 방향으로 f 를 교정.
+
+    **폴백 정책 (사용자 방향)**: 라인은 점이 부족할 때만 쓴다. 점이
+    min_points 개 이상이면 잘 분포한 점만으로 f 가 충분히 안정적이고,
+    라인을 섞으면 오히려 분산이 커질 수 있어(합성 실측) 라인을 무시한다.
+    점이 min_points 미만(4~5개)일 때만 라인으로 f 를 보강한다.
+
+    라인 점이 없으면 (1) 결과 그대로. line_fam: 각 라인 점의 패밀리
+    (_marking_lines 인덱스; 가까운 터치라인=0, 먼=1, 골라인=2/3 …)."""
+    base = calibrate_reference(px_pts, field_pts, img_size)
+    if base is None:
+        return None
+    # 점이 충분하면 라인 무시 (폴백 정책)
+    if (line_px is None or len(line_px) == 0
+            or len(field_pts) >= min_points):
+        base["n_lines"] = 0
+        return base
+    ref = _refine_pose_p2l(line_px, line_fam,
+                           {"R": base["R"], "f": base["f"]},
+                           base["cam_pos"], img_size, length, width)
+    if ref is None:
+        base["n_lines"] = 0
+        return base
+    R, f, K = ref["R"], float(ref["f"]), ref["K"]
+    cam = np.asarray(base["cam_pos"], np.float64)
+    t = (-R @ cam.reshape(3, 1)).reshape(3)
+    obj = np.array([[x, y, 0.0] for x, y in field_pts], np.float64)
+    rv, _ = cv2.Rodrigues(R)
+    proj, _ = cv2.projectPoints(obj, rv, t.reshape(3, 1), K, None)
+    rms = float(np.sqrt(np.mean(np.sum(
+        (proj.reshape(-1, 2) - np.asarray(px_pts, np.float64)) ** 2, axis=1))))
+    return {"f": f, "K": K, "R": R, "t": t, "cam_pos": cam,
+            "rms_px": rms, "res_line": ref.get("res_w"),
+            "n_lines": int(len(line_px)),
+            "img_size": (int(img_size[0]), int(img_size[1]))}
+
+
 def decompose_H(H, K, ratio_range=(0.7, 1.4), steps=36):
     """프레임 간 호모그래피 → (R_rel, f_ratio, 잔차).
 

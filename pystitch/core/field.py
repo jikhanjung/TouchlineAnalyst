@@ -57,9 +57,11 @@ LINE_LANDMARKS = {"sideline_near_l", "sideline_near_r"}
 VLINE_LANDMARKS = {"center_near"}
 
 
-def landmark_positions(length=105.0, width=68.0):
-    """랜드마크의 경기장 좌표 {키: (X, Y)} (m)."""
+def landmark_positions(length=105.0, width=68.0, circle_r=CENTER_CIRCLE_R):
+    """랜드마크의 경기장 좌표 {키: (X, Y)} (m). circle_r 은 경기장별로
+    다를 수 있어 인자 (센터서클 관련 점에만 영향)."""
     hl, hw = length / 2.0, width / 2.0
+    R = circle_r
     return {
         "corner_far_l":  (-hl,  hw),
         "corner_far_r":  ( hl,  hw),
@@ -67,10 +69,10 @@ def landmark_positions(length=105.0, width=68.0):
         "corner_near_r": ( hl, -hw),
         "half_far":      (0.0,  hw),
         "half_near":     (0.0, -hw),
-        "circle_far":    (0.0,  CENTER_CIRCLE_R),
-        "circle_near":   (0.0, -CENTER_CIRCLE_R),
-        "circle_l":      (-CENTER_CIRCLE_R, 0.0),
-        "circle_r":      ( CENTER_CIRCLE_R, 0.0),
+        "circle_far":    (0.0,  R),
+        "circle_near":   (0.0, -R),
+        "circle_l":      (-R, 0.0),
+        "circle_r":      ( R, 0.0),
         "pen_l_far":     (-hl,  PEN_HALF_W),
         "pen_l_near":    (-hl, -PEN_HALF_W),
         "pen_r_far":     ( hl,  PEN_HALF_W),
@@ -457,11 +459,12 @@ def detect_sideline_points(calib, frame, n=64, min_contrast=0.10):
     return np.array(out, float).reshape(-1, 2)
 
 
-def field_outline(length=105.0, width=68.0, step=2.0):
+def field_outline(length=105.0, width=68.0, step=2.0, circle_r=CENTER_CIRCLE_R):
     """미리보기 오버레이용 경기장 선 폴리라인 목록 [(N,2) 필드 좌표, ...].
 
     외곽 사각형, 중앙선, 센터서클, 페널티박스 — 원통 투영에서 곡선이
-    되므로 step(m) 간격으로 샘플링해 잇는다.
+    되므로 step(m) 간격으로 샘플링해 잇는다. circle_r 은 경기장별로 다를
+    수 있어(유소년은 작음) 인자로 받는다 (기본 9.15m).
     """
     hl, hw = length / 2.0, width / 2.0
     pw, pd = PEN_HALF_W, PEN_DEPTH
@@ -478,6 +481,6 @@ def field_outline(length=105.0, width=68.0, step=2.0):
         lines.append(np.stack([np.linspace(x0, x1, n),
                                np.linspace(y0, y1, n)], axis=1))
     a = np.linspace(0, 2 * np.pi, 64)
-    lines.append(np.stack([CENTER_CIRCLE_R * np.sin(a),
-                           CENTER_CIRCLE_R * np.cos(a)], axis=1))
+    lines.append(np.stack([circle_r * np.sin(a),
+                           circle_r * np.cos(a)], axis=1))
     return lines
