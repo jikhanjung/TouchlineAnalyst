@@ -42,8 +42,16 @@ def calibrate_reference(px_pts, field_pts, img_size, f_frac=(0.4, 3.0),
 
     def solve(f):
         K = make_K(f, w, h)
-        ok, rvec, tvec = cv2.solvePnP(obj, img, K, None,
-                                      flags=cv2.SOLVEPNP_ITERATIVE)
+        # 필드 점은 모두 z=0 평면 → IPPE(평면 전용 PnP, 4점부터). 예전
+        # ITERATIVE 는 OpenCV 5.0 에서 4점 평면을 DLT 로 처리하려다
+        # "6점 필요"로 예외를 내며 앱을 죽였다. 퇴화 배치(예: 3점 공선)면
+        # IPPE 도 예외를 내므로 잡아서 무한대 오차로 강등 — 캘리브 없음
+        # (크래시 대신 오버레이 미표시).
+        try:
+            ok, rvec, tvec = cv2.solvePnP(obj, img, K, None,
+                                          flags=cv2.SOLVEPNP_IPPE)
+        except cv2.error:
+            return np.inf, None
         if not ok:
             return np.inf, None
         proj, _ = cv2.projectPoints(obj, rvec, tvec, K, None)
