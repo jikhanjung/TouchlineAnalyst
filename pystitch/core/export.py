@@ -25,7 +25,7 @@ def export_pano(lens, segments, left_files, right_files, offset_sec,
                 pitch_user=0.0, roll_user=0.0, yaw_user=0.0,
                 codec="libx264", crf=19, scale=1.0, feather_px=40,
                 ptz=False, persp_k=0.0, persp_m=1.0, el0=None, el1=None,
-                progress=None, log=print, cancel=None) -> str:
+                progress=None, log=print, cancel=None, gop_sec=2.0) -> str:
     """좌/우 챕터 체인을 정합 세그먼트로 스티칭해 파노라마 영상 인코딩.
 
     progress(done, total, fps) 는 30프레임마다, cancel() -> bool 은 프레임마다
@@ -128,13 +128,19 @@ def export_pano(lens, segments, left_files, right_files, offset_sec,
         concat_list = tf.name
 
     duration = total / fps
+    # 키프레임 간격(GOP): 기본 250(≈8초)이면 큰 원본 프레임 시크가 느리다
+    # (키프레임부터 순차 디코드). gop_sec(기본 2초)로 촘촘히 넣어 원본
+    # 탐색을 빠르게 — 대가는 파일 소폭 증가. keyint_min 까지 줘 고정 GOP.
+    keyint = max(1, int(round(gop_sec * fps)))
+    gop_args = (["-g", str(keyint), "-keyint_min", str(keyint)]
+                if gop_sec and gop_sec > 0 else [])
     cmd = ([ffmpeg_bin(), "-y", "-v", "error",
             "-f", "rawvideo", "-pix_fmt", "bgr24",
             "-s", f"{out_w}x{out_h}", "-r", f"{fps}", "-i", "-",
             "-f", "concat", "-safe", "0", "-ss", f"{start_sec}",
             "-t", f"{duration}", "-i", concat_list,
             "-map", "0:v", "-map", "1:a?"]
-           + encoder_args(codec, crf)
+           + encoder_args(codec, crf) + gop_args
            + ["-pix_fmt", "yuv420p", "-c:a", "aac", "-shortest", out_path])
     enc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
 

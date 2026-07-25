@@ -52,6 +52,17 @@ def available_encoders() -> dict[str, str]:
     return result
 
 
+def resolve_codec(codec: str) -> str:
+    """'auto' → NVENC(GPU) 있으면 h264_nvenc, 없으면 libx264.
+    명시된 코덱(libx264/h264_nvenc 등)은 그대로 둔다."""
+    if codec and codec != "auto":
+        return codec
+    for enc in available_encoders().values():
+        if enc == "h264_nvenc":
+            return enc
+    return "libx264"
+
+
 def encoder_args(encoder: str, crf: int) -> list[str]:
     """인코더별 품질/프리셋 인자."""
     if encoder.endswith("_nvenc"):

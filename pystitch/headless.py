@@ -379,7 +379,7 @@ def _stitch(pair, pano: Path, lens, lens_name, args):
     export_pano(lens, segments, [str(p) for p in left_chain],
                 [str(p) for p in right_chain], offset, t0, t1, str(pano),
                 codec=args.codec, crf=args.crf, feather_px=args.feather,
-                el0=el0, el1=el1, log=_log)
+                el0=el0, el1=el1, gop_sec=args.gop_sec, log=_log)
     if not args.no_proxy:
         _make_scrub_proxy(pano)
 
@@ -391,9 +391,10 @@ def _make_scrub_proxy(pano: Path):
     if out.exists():
         return
     from .core.encoders import available_encoders, ffmpeg_bin
-    encs = available_encoders()
-    venc = (["-c:v", encs["NVENC (H.264)"], "-cq", "26"]
-            if "NVENC (H.264)" in encs
+    # 예전엔 잘못된 키("NVENC (H.264)")로 조회해 NVENC 가 있어도 항상
+    # libx264 로 폴백했다 — 실제 인코더 이름(h264_nvenc)으로 판정.
+    has_nvenc = any(e == "h264_nvenc" for e in available_encoders().values())
+    venc = (["-c:v", "h264_nvenc", "-cq", "26"] if has_nvenc
             else ["-c:v", "libx264", "-preset", "veryfast", "-crf", "24"])
     cmd = [ffmpeg_bin(), "-y", "-v", "error", "-i", str(pano),
            "-vf", "scale=1600:-2", "-g", "15", "-an"] + venc + [str(out)]
@@ -582,8 +583,13 @@ def main(argv=None) -> int:
                     help="출력 디렉터리 (기본: 두 디렉터리 이름의 공통부분으로 "
                          "<left_dir> 옆에 생성, 예: ..._L/..._R → ...)")
     ap.add_argument("--lens", default="GoPro_HERO5_Black_Wide_4K_16x9")
-    ap.add_argument("--codec", default="libx264")
+    ap.add_argument("--codec", default="auto",
+                    help="비디오 코덱 (기본 auto: NVENC 있으면 GPU, "
+                         "없으면 libx264). 강제하려면 libx264/h264_nvenc")
     ap.add_argument("--crf", type=int, default=19)
+    ap.add_argument("--gop-sec", type=float, default=2.0,
+                    help="파노라마 키프레임 간격(초, 기본 2). 촘촘할수록 "
+                         "원본 탐색이 빠르지만 파일이 커진다. 0=인코더 기본")
     ap.add_argument("--feather", type=int, default=40)
     ap.add_argument("--el-top", type=float, default=10.0)
     ap.add_argument("--el-bottom", type=float, default=-45.0)
@@ -617,6 +623,14 @@ def main(argv=None) -> int:
         print(f"렌즈 프로파일 없음: {args.lens} (사용 가능: {', '.join(profiles)})")
         return 1
     lens = LensProfile.load(profiles[args.lens])
+
+    # 코덱 해석: auto → NVENC(GPU) 있으면 자동 사용
+    from .core.encoders import resolve_codec
+    resolved = resolve_codec(args.codec)
+    if resolved != args.codec:
+        _log(f"[encode] 코덱 auto → {resolved}"
+             + (" (GPU)" if resolved.endswith("_nvenc") else " (CPU)"))
+    args.codec = resolved
 
     left_dir, right_dir = Path(args.left_dir), Path(args.right_dir)
     out_dir = (Path(args.out) if args.out
