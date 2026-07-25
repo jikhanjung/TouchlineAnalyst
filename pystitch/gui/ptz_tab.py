@@ -3861,7 +3861,10 @@ class PtzTab(QWidget):
         self._redraw()
         # 프록시로 즉시 표시했으니, 원본(파노라마) 해상도를 백그라운드로
         # 읽어 교체 (스크럽은 프록시로 빠르게, 멈추면 선명한 원본으로).
-        if self.disp_scale < 1.0 and self.mc is None:
+        # 멀티캠 경기에서도 메인 페인이 주 카메라(파노라마)를 보일 때는
+        # 승격한다 — alt 카메라를 메인에 띄운 동안만 제외.
+        alt_main = self.mc is not None and self.mc.alt_on_main
+        if self.disp_scale < 1.0 and not alt_main:
             self._request_native(f)
 
     def _request_native(self, f):
@@ -3874,6 +3877,8 @@ class PtzTab(QWidget):
         self._native_pending = int(f)
         self._native_worker.request(self.pano_path, f, f / max(self.fps, 1e-9),
                                     self.pano_w, self.pano_h)
+        self.log(f"[ptz] 원본 승격 요청: 프레임 {f} "
+                 f"({self.pano_w}x{self.pano_h}) 백그라운드 디코드…")
 
     def _native_frame_ready(self, frame, f):
         """백그라운드 원본 프레임 도착 — 아직 그 프레임이면 선명하게 교체.
@@ -3883,6 +3888,8 @@ class PtzTab(QWidget):
             self._native_pending = None
         if self._playing or self.slider.value() != f \
                 or getattr(self, "_cur_frame_idx", -1) != f:
+            self.log(f"[ptz] 원본 승격 결과 폐기: 프레임 {f} "
+                     "(그새 다른 프레임/재생으로 이동)")
             return
         if frame is None:
             if was_pending:
@@ -3890,6 +3897,7 @@ class PtzTab(QWidget):
                 self._redraw()            # 배지 loading→SCRUB
             return
         self._cur_frame, self._cur_scale = frame, 1.0
+        self.log(f"[ptz] 원본 승격 완료: 프레임 {f} → ORIG")
         self._redraw()
 
     def _redraw(self):
