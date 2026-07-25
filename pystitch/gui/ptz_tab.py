@@ -1793,6 +1793,10 @@ class PtzTab(QWidget):
         # {라인키: [[px,py,frame], ...]} — 터치라인 등 위의 다점 (point-to-
         # line 캘리브). 소실점으로 f 를 안정화. rotcam 전용. LINE_FAMILIES.
         self.field_lines: dict[str, list] = {}
+        # {랜드마크키: [[px,py,frame], ...]} — 무효의 양성 짝: 안 찍었지만
+        # 이송이 정확한 걸 눈으로 확인해 '확정'한 추가 앵커. 이후 이송은
+        # 대상 프레임에 가장 가까운 앵커에서 출발해 체인을 짧게. rotcam 전용.
+        self.field_point_anchors: dict[str, list] = {}
         self._Hcache = {}                 # (src,dst)→이송 H (open 시 재설정)
         self._graycache = {}              # 프레임→det_w 그레이 (open 시 재설정)
         self._lm_transferred = {}         # 현재 프레임 이송 랜드마크
@@ -2969,6 +2973,7 @@ class PtzTab(QWidget):
         self.field_point_frames = {}
         self.field_point_invalid = {}
         self.field_lines = {}
+        self.field_point_anchors = {}
         self.line_points = []
         self.extra_players = {}
         self.kit_colors = {}
@@ -3007,6 +3012,9 @@ class PtzTab(QWidget):
             self.field_lines = {
                 k: [[float(p[0]), float(p[1]), int(p[2])] for p in pts]
                 for k, pts in (doc.get("field_lines") or {}).items()}
+            self.field_point_anchors = {
+                k: [[float(p[0]), float(p[1]), int(p[2])] for p in pts]
+                for k, pts in (doc.get("field_point_anchors") or {}).items()}
             self.line_points = [list(p) for p in doc.get("line_points", [])]
             self.extra_players = {int(si): [list(p) for p in rows]
                                   for si, rows in
@@ -3111,6 +3119,8 @@ class PtzTab(QWidget):
                                    "field_point_invalid":
                                        self.field_point_invalid,
                                    "field_lines": self.field_lines,
+                                   "field_point_anchors":
+                                       self.field_point_anchors,
                                    "field_size": self.field_size,
                                    "field_circle_r": self.field_circle_r,
                                    "field_circle_auto": self.field_circle_auto,
@@ -4502,6 +4512,27 @@ class PtzTab(QWidget):
                             f"[{tag}] 이송 무효 구간 전체 해제",
                             lambda _=False, kk=near:
                             self._lm_clear_invalid(kk))
+            # rotcam: 이 프레임 이송이 실제 라인과 맞으면 '확정'해 앵커로
+            # 승격 → 이후 먼 프레임 이송의 최단 소스 (프레임 일괄).
+            if getattr(self, "_is_rotcam", False):
+                ff = int(getattr(self, "_cur_frame_idx", self.slider.value()))
+                n_tr = sum(
+                    1 for k in self._lm_transferred
+                    if not (self.field_point_frames.get(k) is not None
+                            and int(self.field_point_frames[k]) == ff))
+                n_conf = sum(1 for k in self.field_point_anchors
+                             for a in self.field_point_anchors[k]
+                             if int(a[2]) == ff)
+                if n_tr or n_conf:
+                    menu.addSeparator()
+                    if n_tr:
+                        menu.addAction(
+                            f"✓ 이 프레임 이송 {n_tr}개 확정 (앵커 승격)",
+                            lambda _=False: self._rc_confirm_frame())
+                    if n_conf:
+                        menu.addAction(
+                            f"이 프레임 확정 {n_conf}개 해제",
+                            lambda _=False: self._rc_unconfirm_frame())
         menu.exec(gpos)
 
     def _pane_hover(self, fx, fy):
@@ -5869,6 +5900,7 @@ class PtzTab(QWidget):
             self.field_point_frames = {}
             self.field_point_invalid = {}
             self.field_lines = {}
+            self.field_point_anchors = {}
             self.line_points = []
         if self.analysis is not None:
             self._teams = classify_teams(self.analysis, roles=self.roles,
@@ -6476,10 +6508,11 @@ class PtzTab(QWidget):
 
     def _field_remove_point(self, key):
         if self.field_points.pop(key, None) is not None:
-            # 그 키의 프레임/무효구간도 함께 제거 — 안 그러면 재지정 시
-            # 옛 프레임에서 이송/무효처리돼 엉뚱해진다.
+            # 그 키의 프레임/무효구간/확정앵커도 함께 제거 — 안 그러면
+            # 재지정 시 옛 프레임에서 이송/무효처리돼 엉뚱해진다.
             self.field_point_frames.pop(key, None)
             self.field_point_invalid.pop(key, None)
+            self.field_point_anchors.pop(key, None)
             self._rc_pose_gen = getattr(self, "_rc_pose_gen", 0) + 1
             self._refit_field()
             self._save_keyframes()
@@ -6507,6 +6540,7 @@ class PtzTab(QWidget):
         self.field_point_frames = {}
         self.field_point_invalid = {}
         self.field_lines = {}
+        self.field_point_anchors = {}
         self.line_points = []
         self._rc_pose_gen = getattr(self, "_rc_pose_gen", 0) + 1
         self._rc_calib = None
@@ -6642,6 +6676,10 @@ class PtzTab(QWidget):
             col = LINE_FAMILIES[key][2]
             for _lx, _ly, fr in pts:
                 marks.append((int(fr), "", col))
+        # 확정 앵커 — 초록 틱 (안 찍었지만 이송을 눈으로 확인·확정한 프레임)
+        for _k, pts in self.field_point_anchors.items():
+            for _ax, _ay, fr in pts:
+                marks.append((int(fr), "", (0, 200, 0)))
         self.trackbar.set_landmarks(marks)
 
     def _refresh_field_list(self):
@@ -6772,28 +6810,28 @@ class PtzTab(QWidget):
                          f"R = {self.field_circle_r}m (교차비)")
         pos = landmark_positions(self.field_size[0], self.field_size[1],
                                  circle_r=self.field_circle_r)
-        usable = [(k, self.field_points[k], self.field_point_frames.get(k))
-                  for k in self.field_points
-                  if k not in LINE_LANDMARKS and k not in VLINE_LANDMARKS
-                  and k in pos]
+        keys = [k for k in self.field_points
+                if k not in LINE_LANDMARKS and k not in VLINE_LANDMARKS
+                and k in pos]
         self._rc_calib = None
-        if len(usable) < 4:
+        if len(keys) < 4:
             return
-        # 기준 프레임 = 랜드마크 최빈 프레임 (이송 비용 최소)
-        rec = [f for _k, _p, f in usable if f is not None]
+        # 기준 프레임 = 배치+확정앵커 프레임 최빈 (이송 비용 최소)
+        rec = []
+        for k in keys:
+            f = self.field_point_frames.get(k)
+            if f is not None:
+                rec.append(int(f))
+            rec += [int(a[2]) for a in self.field_point_anchors.get(k, ())]
         ref = int(max(set(rec), key=rec.count)) if rec else \
             int(self.slider.value())
         px, fld, skipped = [], [], 0
-        for k, p, f in usable:
-            src = int(f) if f is not None else ref
-            if src != ref:
-                if self._lm_invalid_here(k, ref):   # 기준 프레임 이송 무효
-                    continue
-                H = self._rc_H(src, ref)
-                if H is None:
-                    skipped += 1
-                    continue
-                p = [float(v) for v in transfer_points(H, [p])[0]]
+        for k in keys:
+            got = self._rc_anchor_for(k, ref)      # 무효 체크 + 최단 앵커 이송
+            if got is None:
+                skipped += 1
+                continue
+            p, _src = got
             px.append(p)
             fld.append([float(pos[k][0]), float(pos[k][1])])
         if len(px) < 4:
@@ -7022,23 +7060,18 @@ class PtzTab(QWidget):
             return cache[cur]
         from ..core.field import (LINE_LANDMARKS, VLINE_LANDMARKS,
                                   landmark_positions)
-        from ..core.rotcam import anchor_rotation, transfer_points
-        pos = landmark_positions(self.field_size[0], self.field_size[1])
+        from ..core.rotcam import anchor_rotation
+        pos = landmark_positions(self.field_size[0], self.field_size[1],
+                                 circle_r=self.field_circle_r)
         cam = np.asarray(rc["cam_pos"])
         px, fld = [], []
-        for k, pt in self.field_points.items():
+        for k in self.field_points:
             if k in LINE_LANDMARKS or k in VLINE_LANDMARKS or k not in pos:
                 continue
-            if self._lm_invalid_here(k, cur):     # 이 프레임 이송 무효
+            got = self._rc_anchor_for(k, cur)     # 무효 체크 + 최단 앵커 이송
+            if got is None:
                 continue
-            kf = self.field_point_frames.get(k)
-            if kf is None or int(kf) == cur:
-                p = pt
-            else:
-                H = self._rc_H(int(kf), cur)
-                if H is None:
-                    continue
-                p = [float(v) for v in transfer_points(H, [pt])[0]]
+            p, _src = got
             px.append(p)
             fld.append([float(pos[k][0]), float(pos[k][1])])
         got = None
@@ -7146,26 +7179,98 @@ class PtzTab(QWidget):
         self._refresh_field_list()
         self._redraw()
 
+    def _rc_anchor_for(self, k, cur):
+        """랜드마크 k 를 프레임 cur 로 이송할 최적 소스 → ([x,y], src_frame).
+        원 배치 + 확정 앵커 중 cur 에 가장 가까운(=이송 체인 최단) 소스에서
+        이송한다. cur 에 앵커/배치가 직접 있으면 그대로. 이 프레임 이송이
+        무효이거나 이송 불가면 None. 팬 카메라라 먼 프레임끼리는 직접
+        매칭이 안 되므로, 검증된 중간 앵커가 브리지 역할을 한다."""
+        if self._lm_invalid_here(k, cur):
+            return None
+        cands = []                                # (frame, [x, y])
+        p0 = self.field_points.get(k)
+        if p0 is not None:
+            f0 = self.field_point_frames.get(k)
+            cands.append((int(f0) if f0 is not None else cur,
+                          [float(p0[0]), float(p0[1])]))
+        for ax, ay, af in self.field_point_anchors.get(k, ()):
+            cands.append((int(af), [float(ax), float(ay)]))
+        if not cands:
+            return None
+        cands.sort(key=lambda c: abs(c[0] - cur))     # cur 에 가까운 소스부터
+        from ..core.rotcam import transfer_points
+        for src, px in cands:
+            if src == cur:
+                return px, src
+            H = self._rc_H(src, cur)
+            if H is not None:
+                q = transfer_points(H, [px])[0]
+                return [float(q[0]), float(q[1])], src
+        return None
+
     def _rc_transfer_landmarks(self):
-        """찍은 랜드마크를 현재 프레임으로 이송 → _lm_transferred.
+        """찍은 랜드마크 + 확정 앵커를 현재 프레임으로 이송 → _lm_transferred.
         회전 카메라에서 팬을 따라 랜드마크가 움직이도록 (사용자 요청).
-        이 프레임에서 무효로 표시된 랜드마크는 이송하지 않는다."""
+        각 랜드마크는 현재 프레임에 가장 가까운 소스에서 이송하며, 이
+        프레임에서 무효인 것은 건너뛴다."""
         self._lm_transferred = {}
         if not getattr(self, "_is_rotcam", False):
             return
         cur = int(getattr(self, "_cur_frame_idx", self.slider.value()))
-        for k, pt in self.field_points.items():
-            if self._lm_invalid_here(k, cur):
-                continue                      # 이 프레임 이송 무효 — 건너뜀
+        for k in self.field_points:
+            got = self._rc_anchor_for(k, cur)
+            if got is not None:
+                (x, y), _src = got
+                self._lm_transferred[k] = (x, y)
+
+    def _rc_confirm_frame(self):
+        """현재 프레임의 이송 랜드마크를 확정 앵커로 일괄 승격.
+        이송이 실제 라인과 맞는 걸 눈으로 확인한 뒤 호출 — 그 프레임을
+        '찍은 것과 동등'한 앵커로 고정해 이후 이송의 최단 소스로 쓴다.
+        원 배치 프레임(이미 앵커)인 것은 제외."""
+        if not getattr(self, "_is_rotcam", False):
+            return
+        cur = int(getattr(self, "_cur_frame_idx", self.slider.value()))
+        self._rc_transfer_landmarks()             # cur 기준 이송 최신화
+        n = 0
+        for k, (x, y) in list(self._lm_transferred.items()):
             src = self.field_point_frames.get(k)
-            if src is None or int(src) == cur:
-                self._lm_transferred[k] = (pt[0], pt[1])
-                continue
-            from ..core.rotcam import transfer_points
-            H = self._rc_H(src, cur)
-            if H is not None:
-                q = transfer_points(H, [pt])[0]
-                self._lm_transferred[k] = (float(q[0]), float(q[1]))
+            if src is not None and int(src) == cur:
+                continue                          # 원 배치 프레임 — 스킵
+            lst = self.field_point_anchors.setdefault(k, [])
+            lst[:] = [a for a in lst if int(a[2]) != cur]   # 같은 프레임 갱신
+            lst.append([round(float(x), 1), round(float(y), 1), cur])
+            n += 1
+        if not n:
+            self.log(f"[field] 프레임 {cur}: 확정할 이송 랜드마크 없음")
+            return
+        self._rc_pose_gen = getattr(self, "_rc_pose_gen", 0) + 1
+        self._save_keyframes()
+        self._refit_field(log_result=True)
+        self._refresh_field_list()
+        self._redraw()
+        self.log(f"[field] 프레임 {cur} 이송 {n}개 확정 (앵커 승격)")
+
+    def _rc_unconfirm_frame(self):
+        """현재 프레임의 확정 앵커 제거 (일괄)."""
+        cur = int(getattr(self, "_cur_frame_idx", self.slider.value()))
+        n = 0
+        for k in list(self.field_point_anchors):
+            keep = [a for a in self.field_point_anchors[k] if int(a[2]) != cur]
+            if len(keep) != len(self.field_point_anchors[k]):
+                n += 1
+            if keep:
+                self.field_point_anchors[k] = keep
+            else:
+                del self.field_point_anchors[k]
+        if not n:
+            return
+        self._rc_pose_gen = getattr(self, "_rc_pose_gen", 0) + 1
+        self._save_keyframes()
+        self._refit_field(log_result=True)
+        self._refresh_field_list()
+        self._redraw()
+        self.log(f"[field] 프레임 {cur} 확정 {n}개 해제")
 
     def _native_frame(self, f):
         """프레임 f 의 원본 해상도 이미지 (프록시 표시 중이면 원본을 읽음)."""
