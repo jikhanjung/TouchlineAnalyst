@@ -1000,6 +1000,7 @@ class LinkWorker(QThread):
     """
 
     done = pyqtSignal(dict)
+    log = pyqtSignal(str)
 
     def __init__(self, analysis, analysis_path=None, video_path=None):
         super().__init__()
@@ -1008,15 +1009,32 @@ class LinkWorker(QThread):
         self.video_path = video_path
 
     def run(self):
+        import time
         from ..core.ptz import link_ball_tracks_cached, measure_top_black
-        if self.analysis_path:
-            linked = link_ball_tracks_cached(self.analysis_path,
-                                             self.analysis)
-        else:
-            linked = link_ball_tracks(self.analysis)
-        linked["teams"] = classify_teams(self.analysis)
-        if self.video_path:                    # 상단 검은 경계 실측
-            linked["top_black"] = measure_top_black(self.video_path)
+        t0 = time.perf_counter()
+        try:
+            self.log.emit("[ptz] · 공 트랙 연결 중…")
+            if self.analysis_path:
+                linked = link_ball_tracks_cached(self.analysis_path,
+                                                 self.analysis)
+            else:
+                linked = link_ball_tracks(self.analysis)
+            self.log.emit(
+                f"[ptz] · 팀 색 분류 중… (+{time.perf_counter()-t0:.1f}s)")
+            linked["teams"] = classify_teams(self.analysis)
+            if self.video_path:                # 상단 검은 경계 실측
+                self.log.emit(
+                    f"[plan] · 상단 검은 경계 실측 중 — 원본 5프레임 "
+                    f"시크(성긴 GOP면 수 초)… (+{time.perf_counter()-t0:.1f}s)")
+                linked["top_black"] = measure_top_black(self.video_path)
+            self.log.emit(
+                f"[ptz] · 트랙 연결 워커 완료 (+{time.perf_counter()-t0:.1f}s)")
+        except Exception as e:  # noqa: BLE001 — 예외로 죽으면 대기 커서가
+            # 영영 안 풀린다. 오류를 담아 done 을 반드시 방출 (_link_done
+            # 이 커서 해제 후 안전 종료).
+            self.log.emit(f"[ptz] 트랙 연결 워커 오류: {e}")
+            self.done.emit({"_error": str(e)})
+            return
         self.done.emit(linked)
 
 
@@ -1973,7 +1991,10 @@ class PtzTab(QWidget):
         self._radar_lbl.hide()
 
     def log(self, msg):
-        """메인 윈도우 로그 + 탭 내 로그 미러."""
+        """메인 윈도우 로그 + 탭 내 로그 미러. 각 줄 앞에 현재 시각(ms)
+        — 단계 사이 지연을 눈으로 재기 위함."""
+        from datetime import datetime
+        msg = f"[{datetime.now().strftime('%H:%M:%S.%f')[:-3]}] {msg}"
         self._ext_log(msg)
         lv = getattr(self, "log_view", None)
         if lv is not None:
@@ -4713,8 +4734,14 @@ class PtzTab(QWidget):
         w._analysis_id = id(self.analysis)    # 결과 도착 시 최신인지 확인
         w.done.connect(lambda linked, aid=id(self.analysis):
                        self._link_done(linked, aid))
+        w.log.connect(self.log)               # 워커 단계 로그 → 로그 탭
         self._link_worker = w
         self.log("[ptz] 트랙 연결 계산 중... (완료 후 클릭 반응이 빨라짐)")
+        # 비동기 워커라도 완료까지 대기 커서 — measure_top_black 의 원본
+        # 시크가 수 초 걸려 '멈춘 듯' 보이던 걸 '작업 중'으로 표시.
+        if not getattr(self, "_link_cursor", False):
+            QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+            self._link_cursor = True
         w.start()
 
     def _airborne_key(self):
@@ -4782,6 +4809,12 @@ class PtzTab(QWidget):
             self._redraw()
 
     def _link_done(self, linked, analysis_id=None):
+        # 워커 완료 → 대기 커서 해제 (레이스로 버려지는 경우도 반드시 해제)
+        if getattr(self, "_link_cursor", False):
+            QApplication.restoreOverrideCursor()
+            self._link_cursor = False
+        if "tracks" not in linked:            # 워커 오류(_error) — 커서만 풀고 종료
+            return
         # 영상 전환 레이스: 이 결과가 계산될 때의 analysis 가 아직 현재
         # 것인지 확인 — 아니면 버린다 (옛 트랙 인덱스가 새 analysis
         # 범위를 벗어나 IndexError 나던 문제)
