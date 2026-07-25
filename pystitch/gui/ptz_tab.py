@@ -88,7 +88,12 @@ def _ffmpeg_frame(path, t, w, h, timeout=45.0):
     ffmpeg 는 `-ss` 를 입력 앞에 둬 키프레임으로 빠르게 시크한 뒤 정확
     위치까지만 멀티스레드 디코드 — 같은 프레임이 ~2~3초로 끝난다."""
     import subprocess
-    cmd = ["ffmpeg", "-v", "error", "-ss", f"{max(0.0, t):.6f}",
+
+    from ..core.encoders import ffmpeg_bin
+    # ffmpeg_bin() 리졸버 사용 필수 — 바 "ffmpeg" 는 winget 설치 후 앱
+    # PATH 에 안 잡혀(ffmpeg_bin 독스트링 참고) FileNotFoundError 로
+    # 조용히 실패했다. 그러면 원본 승격이 영영 안 돼 SCRUB 만 남는다.
+    cmd = [ffmpeg_bin(), "-v", "error", "-ss", f"{max(0.0, t):.6f}",
            "-i", str(path), "-frames:v", "1",
            "-f", "rawvideo", "-pix_fmt", "bgr24", "-"]
     try:
