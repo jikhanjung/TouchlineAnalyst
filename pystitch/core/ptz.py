@@ -1601,6 +1601,41 @@ def _ffmpeg_gray_strip(video_path, t, w, rows, timeout=30.0):
     return np.frombuffer(p.stdout[:need], np.uint8).reshape(rows, w)
 
 
+def _ffmpeg_gray_strips(video_path, times, w, rows, timeout=60.0):
+    """여러 시점의 상단 rows행 그레이 스트립을 ffmpeg **한 프로세스**로.
+
+    각 시점을 별도 입력(-ss)으로 주고 crop 후 vstack — 시점마다 프로세스
+    시작·파일 열기(대용량 원본은 헤더 파싱이 큰 비용)를 반복하지 않는다.
+    반환 [(rows,w) …] (시점 순서) 또는 실패 시 None."""
+    import subprocess
+
+    from .encoders import ffmpeg_bin
+    n = len(times)
+    if n == 0:
+        return None
+    cmd = [ffmpeg_bin(), "-v", "error"]
+    for t in times:
+        cmd += ["-ss", f"{max(0.0, t):.6f}", "-noaccurate_seek",
+                "-i", str(video_path)]
+    if n == 1:
+        fc = f"[0:v]crop=iw:{rows}:0:0[out]"
+    else:
+        fc = "".join(f"[{i}:v]crop=iw:{rows}:0:0[a{i}];" for i in range(n))
+        fc += "".join(f"[a{i}]" for i in range(n)) + f"vstack=inputs={n}[out]"
+    cmd += ["-filter_complex", fc, "-map", "[out]", "-frames:v", "1",
+            "-f", "rawvideo", "-pix_fmt", "gray", "-"]
+    try:
+        p = subprocess.run(cmd, stdout=subprocess.PIPE,
+                           stderr=subprocess.DEVNULL, timeout=timeout)
+    except Exception:  # noqa: BLE001
+        return None
+    need = w * rows * n
+    if len(p.stdout) < need:
+        return None
+    buf = np.frombuffer(p.stdout[:need], np.uint8).reshape(n * rows, w)
+    return [buf[i * rows:(i + 1) * rows] for i in range(n)]
+
+
 def measure_top_black(video_path, samples=5, dark=18, cover=0.90):
     """파노라마 상단 검은 스티칭 경계 높이 실측 (px).
 
@@ -1608,8 +1643,9 @@ def measure_top_black(video_path, samples=5, dark=18, cover=0.90):
     (--auto-el 산출물은 대개 0). 몇 프레임을 샘플해 행의 어두운 픽셀
     비율이 cover 이상인 최상단 연속 구간의 최대 높이 + 8px 여유.
 
-    시크는 ffmpeg 빠른 시크(-ss) — 성긴 GOP 원본에서 cap.set 순차
-    디코드가 지점당 수 초 걸리던 걸 회피 (실패 시 cv2 폴백).
+    시크는 ffmpeg 빠른 시크(-ss)이고, 모든 샘플을 **한 프로세스**로 한
+    번에 뽑는다 — 성긴 GOP 원본에서 cap.set 순차 디코드(지점당 수 초) +
+    시점마다 프로세스 재시작 비용을 회피 (실패 시 개별→cv2 폴백).
     """
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
@@ -1619,13 +1655,18 @@ def measure_top_black(video_path, samples=5, dark=18, cover=0.90):
     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 1
     fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
     rows = min(240, h) or 240
+    fnos = [int(total * (k + 0.5) / samples) for k in range(samples)]
+    times = [fno / max(fps, 1e-9) for fno in fnos]
+    # 1순위: 한 프로세스로 전 샘플. 실패하면 샘플별 개별 ffmpeg, 그것도
+    # 실패하면 cv2 순차 시크.
+    strips = _ffmpeg_gray_strips(video_path, times, w, rows) if w > 0 else None
     worst = 0
     for k in range(samples):
-        fno = int(total * (k + 0.5) / samples)
-        strip = (_ffmpeg_gray_strip(video_path, fno / max(fps, 1e-9), w, rows)
-                 if w > 0 else None)
+        strip = strips[k] if strips is not None else (
+            _ffmpeg_gray_strip(video_path, times[k], w, rows)
+            if w > 0 else None)
         if strip is None:                     # 빠른 시크 실패 → cv2 순차 폴백
-            cap.set(cv2.CAP_PROP_POS_FRAMES, fno)
+            cap.set(cv2.CAP_PROP_POS_FRAMES, fnos[k])
             ok, frame = cap.read()
             if not ok:
                 continue
