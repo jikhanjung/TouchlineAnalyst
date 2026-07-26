@@ -376,12 +376,54 @@ def _stitch(pair, pano: Path, lens, lens_name, args):
                  "el_bottom_deg": round(float(np.rad2deg(el0)), 2)},
     })
 
+    _level_preview(pano, lens, segments, left_chain, right_chain,
+                   offset, t0, el0, el1)
     export_pano(lens, segments, [str(p) for p in left_chain],
                 [str(p) for p in right_chain], offset, t0, t1, str(pano),
                 codec=args.codec, crf=args.crf, feather_px=args.feather,
                 el0=el0, el1=el1, gop_sec=args.gop_sec, log=_log)
     if not args.no_proxy:
         _make_scrub_proxy(pano)
+
+
+def _level_preview(pano: Path, lens, segments, left_chain, right_chain,
+                   offset, t0, el0, el1):
+    """스티칭 **시작 전** 수평 확인 프리뷰 1장 (<pano>.preview.jpg).
+
+    auto-level 이 발산해 엉뚱한 pitch/roll 을 채택해도 몇 시간 인코드가
+    끝나야 눈에 보였다 (효창 실측, devlog 081) — 정합 직후 저장해 인코드
+    도중 확인·조기 중단이 가능하게 (사용자 방향: 스티칭 시작 때 확인).
+    실패해도 파이프라인은 계속 (프리뷰는 보조 산출물)."""
+    try:
+        from .core.chapters import ChapteredVideo
+        from .core.render import Renderer
+        a = segments[0]["alignment"]
+        t = max(t0, float(segments[0].get("align_sec", t0)))
+        vl = ChapteredVideo([str(p) for p in left_chain])
+        vr = ChapteredVideo([str(p) for p in right_chain])
+        try:
+            ok_l, img_l = vl.read_at(int(round(t * vl.fps)))
+            ok_r, img_r = vr.read_at(int(round((t + offset) * vl.fps)))
+        finally:
+            vl.release()
+            vr.release()
+        if not (ok_l and ok_r):
+            raise RuntimeError("프리뷰 프레임 읽기 실패")
+        w0, w1 = a.window(0.0)
+        half = (w1 - w0) / 2
+        r = Renderer(lens, *a.rotations(0.0, 0.0),
+                     a.yaw_auto - half, a.yaw_auto + half,
+                     el0, el1, scale=0.3, feather_px=12)
+        r.set_gains_from(img_l, img_r)
+        prev = pano.with_suffix(".preview.jpg")
+        cv2.imwrite(str(prev), r.render(img_l, img_r),
+                    [cv2.IMWRITE_JPEG_QUALITY, 88])
+        _log(f"[level] 수평 확인 프리뷰 저장: {prev.name} "
+             f"(pitch {np.rad2deg(a.pitch_auto):+.1f}°, "
+             f"roll {np.rad2deg(a.roll_auto):+.1f}°) — 인코드 중 눈으로 "
+             "확인, 틀어졌으면 중단 후 GUI/재수출로 보정")
+    except Exception as e:  # noqa: BLE001 — 보조 산출물, 파이프라인 유지
+        _log(f"[level] 프리뷰 생성 실패 (계속 진행): {e}")
 
 
 def _make_scrub_proxy(pano: Path):
