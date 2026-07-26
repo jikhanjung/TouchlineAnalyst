@@ -110,7 +110,11 @@ def calibrate_reference(px_pts, field_pts, img_size, f_frac=(0.4, 3.0),
         # 전 범위 재피팅(~140ms)을 수십 ms 로. 전 범위는 놓을 때.
         f_frac = (0.85 * f_hint / w, 1.15 * f_hint / w)
         steps, golden = 7, 12
-    # 1) 이상치 배제 — f 거친 스캔 × RANSAC, (inlier 수, -rms) 최대 선택
+    # 1) 이상치 배제 — f 거친 스캔 × RANSAC, (inlier 수, -rms) 최대 선택.
+    # RANSAC 은 난수 기반이라 같은 입력에도 호출마다 inlier 가 달라질 수
+    # 있다 — 시드를 고정해 결정론화 (드래그 중 라인과 놓은 뒤 라인이
+    # 달라 보이던 지터의 원인 중 하나).
+    cv2.setRNGSeed(7)
     best = None
     for f in np.linspace(f_frac[0] * w, f_frac[1] * w, steps):
         K = make_K(f, w, h)

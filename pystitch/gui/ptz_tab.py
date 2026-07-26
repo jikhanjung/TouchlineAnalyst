@@ -7057,8 +7057,14 @@ class PtzTab(QWidget):
         keys = [k for k in self.field_points
                 if k not in LINE_LANDMARKS and k not in VLINE_LANDMARKS
                 and k in pos]
-        prev = getattr(self, "_rc_calib", None)
-        f_hint = (float(prev["f"]) if live and prev is not None else None)
+        # live 힌트는 **마지막 전 범위(full) 피팅의 f** 에 고정 — 직전
+        # live 틱의 f 에 앵커하면 드래그 동안 f 가 랜덤워크로 흘러가
+        # 놓는 순간(full) 라인이 튀어 보인다.
+        f_hint = None
+        if live:
+            prev = getattr(self, "_rc_calib", None)
+            f_hint = getattr(self, "_rc_f_full", None) or \
+                (float(prev["f"]) if prev is not None else None)
         self._rc_calib = None
         if len(keys) < 4:
             return
@@ -7112,6 +7118,10 @@ class PtzTab(QWidget):
             cal["ref_frame"] = ref
             self._rc_calib = cal
             self._rc_skip = skipped
+            if not live:                  # live 힌트 기준점 갱신 (full 만)
+                self._rc_f_full = float(cal["f"])
+        elif not live:
+            self._rc_f_full = None
         self._save_hcache()               # 리핏 중 계산된 H 도 디스크에
 
     def _field_status(self):
