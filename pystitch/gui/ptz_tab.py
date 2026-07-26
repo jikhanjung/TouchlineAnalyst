@@ -6675,6 +6675,66 @@ class PtzTab(QWidget):
         self._merges_changed()
         self.log(f"[merge] 그룹 #{rep} 해체 ({n}개 분리)")
 
+    def merge_same_numbers(self):
+        """같은 팀·같은 등번호 트랙릿 일괄 병합 (동시 등장 없을 때만).
+
+        번호 지정 시점 자동 병합(_set_player_num)이 생기기 전의 데이터,
+        OCR 일괄 수락 등으로 같은 번호가 여러 트랙릿에 흩어져 있다 —
+        한 번에 정리 (사용자 방향). 같은 팀 같은 번호 두 명은 물리적으로
+        불가하므로 동시 등장(>2샘플)은 다른 사람(오배정)으로 보고
+        보류·로그. 후보는 이미 수락된 그룹 '전원'과 비교해 넣는다."""
+        if self.analysis is None:
+            QMessageBox.information(self, "같은 등번호 병합",
+                                    "먼저 분석이 필요합니다.")
+            return
+        from collections import defaultdict
+        with self._busy("같은 등번호 트랙릿 병합 (동시 등장 검사)"):
+            # 대표별 등장 샘플 집합 — 1패스, 이후 교집합으로 즉시 판정
+            presence = defaultdict(set)
+            for si, prow in enumerate(self.analysis["players"]):
+                for p in prow:
+                    if len(p) >= 5 and p[4] >= 0:
+                        presence[self._rep(int(p[4]))].add(si)
+            for si, rows in self.extra_players.items():
+                for p in rows:
+                    if len(p) >= 5:
+                        presence[self._rep(int(p[4]))].add(int(si))
+            groups = defaultdict(list)      # (팀, 번호) → [rep ...]
+            for t in list(self.player_nums):
+                n = self.player_nums[t]
+                rep = self._rep(t)
+                role = self._role_of(rep)
+                team = 0 if role in (0, 3) else (1 if role in (1, 4)
+                                                 else None)
+                if team is None or not n:
+                    continue
+                if rep not in groups[(team, str(n))]:
+                    groups[(team, str(n))].append(rep)
+            pairs, held = [], 0
+            for (team, num), reps in sorted(groups.items()):
+                if len(reps) < 2:
+                    continue
+                acc = [reps[0]]             # 수락된 멤버 (전원과 비교)
+                for other in reps[1:]:
+                    co = max((len(presence[a] & presence[other])
+                              for a in acc), default=0)
+                    if co > 2:              # 검출 지터 여유
+                        held += 1
+                        self.log(f"[merge] 팀{team + 1} {num}번: #{acc[0]} ↔ "
+                                 f"#{other} 동시 {co}샘플 — 보류 (다른 사람?)")
+                        continue
+                    pairs.append((other, acc[0]))
+                    acc.append(other)
+            if pairs:
+                from ..core.tracklets import merge_map
+                spans, _ = self._player_cache()
+                self.merges = merge_map(
+                    pairs + list(self.merges.items()),
+                    {t: spans[t][2] for t in spans})
+                self._merges_changed()
+        self.log(f"[merge] 같은 등번호 병합: {len(pairs)}건 병합"
+                 + (f", 동시 등장 {held}건 보류" if held else ""))
+
     # ------------------------------------------------------ 경기장 캘리브레이션
     def _review_tab_changed(self, idx):
         if idx != 2:                      # 경기장 탭을 떠나면 찍기 모드 해제

@@ -109,6 +109,8 @@ class MainWindow(QMainWindow):
                     lambda: self.ptz_tab.detect_events())
         a.addAction("트랙릿 병합 제안 (ReID 라이트)",
                     lambda: self.ptz_tab.suggest_tracklet_merges())
+        a.addAction("같은 등번호 트랙릿 병합",
+                    lambda: self.ptz_tab.merge_same_numbers())
         a.addAction("등번호 OCR (파노라마는 근측만)...",
                     lambda: self.ptz_tab.run_jersey_ocr())
         a.addSeparator()
