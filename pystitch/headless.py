@@ -444,6 +444,23 @@ def _analyze(pano: Path, args):
     return cache
 
 
+def _far_augment(pano: Path, args):
+    """기존 분석에 원경 타일 사람 검출만 추가 (tid 800001+, 편집 보존)."""
+    from .core.ptz import analysis_summary, augment_far_persons
+    out = pano.with_suffix(".analysis.json")
+    d = json.loads(out.read_text())
+    if d.get("far_augment"):
+        _log(f"[far] {out.name} 이미 보강됨 — 건너뜀 "
+             f"(+{d['far_augment'].get('added', '?')}행)")
+        return
+    added = augment_far_persons(str(pano), d, weights=args.weights, log=_log)
+    tmp = Path(str(out) + ".tmp")
+    tmp.write_text(json.dumps(d))
+    tmp.replace(out)
+    analysis_summary(out, d, log=_log)    # 요약 캐시 재생성 (스팬/세그)
+    _log(f"[far] {out.name} 갱신 (+{added}행)")
+
+
 def _whistle(pano: Path, args):
     """호각 트랙 추출 (.whistle.json) — 타임라인 호각 레인 + 멀티캠
     동기화(sync_cams)의 전제. 오디오만 읽으므로 파노라마당 수 분."""
@@ -549,8 +566,12 @@ def process_pair(pair, out_dir: Path, lens, lens_name, args) -> Path:
             _stitch(pair, pano, lens, lens_name, args)
     ana = pano.with_suffix(".analysis.json")
     cache = None
-    if ana.exists() and not args.force:
-        _log(f"[analyze] {ana.name} 있음 — 건너뜀")
+    if ana.exists() and not args.force and not args.reanalyze:
+        if args.far_augment:
+            with tm.stage("far_augment"):
+                _far_augment(pano, args)
+        else:
+            _log(f"[analyze] {ana.name} 있음 — 건너뜀")
     else:
         with tm.stage("analyze"):
             cache = _analyze(pano, args)
@@ -616,6 +637,14 @@ def main(argv=None) -> int:
     ap.add_argument("--no-proxy", action="store_true",
                     help="스크럽/재생 프록시(.scrub.mp4) 생성 안 함")
     ap.add_argument("--force", action="store_true", help="기존 산출물 무시하고 재실행")
+    ap.add_argument("--reanalyze", action="store_true",
+                    help="기존 .analysis.json 이 있어도 분석을 처음부터 다시 "
+                         "(신 검출 코드 전체 반영). 주의: 트랙릿 tid 가 전부 "
+                         "바뀌어 기존 수동 편집(역할·병합·번호) 연결이 끊김")
+    ap.add_argument("--far-augment", action="store_true",
+                    help="기존 분석에 원경 네이티브 타일 '사람' 검출만 추가 "
+                         "(tid 800001+). 기존 트랙릿·수동 편집 보존 — 편집한 "
+                         "영상의 저렴한 대안 (재실행 안전: 이미 보강했으면 스킵)")
     args = ap.parse_args(argv)
 
     profiles = builtin_profiles()

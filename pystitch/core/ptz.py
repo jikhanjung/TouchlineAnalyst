@@ -186,6 +186,37 @@ class _FarTracker:
         return out
 
 
+def _far_person_tiles(model, frame, y0b, y1b, conf_far):
+    """원경 밴드를 정사각 네이티브 타일로 잘라 공+사람 검출.
+
+    반환: (far_balls, far_persons) — rows [cx, cy, conf, w, h] (원본
+    좌표). 공은 0.15, 사람은 conf_far 이상. analyze_video 와
+    augment_far_persons 가 공유하는 단일 경로."""
+    strip = frame[y0b:y1b]
+    th = strip.shape[0]
+    step = max(1, int(th * 0.85))              # 15% 겹침
+    offs = list(range(0, max(strip.shape[1] - th, 1), step))
+    offs.append(strip.shape[1] - th)           # 우측 끝 보장
+    tiles = [strip[:, x:x + th] for x in offs]
+    imgsz_t = (th + 31) // 32 * 32
+    results = model.predict(tiles, imgsz=imgsz_t, conf=min(0.15, conf_far),
+                            classes=[_CLS_BALL, _CLS_PERSON], verbose=False)
+    far_balls, far_persons = [], []
+    for x_off, r2 in zip(offs, results):
+        for b2 in r2.boxes:
+            bx1, by1, bx2, by2 = b2.xyxy[0].tolist()
+            c2 = float(b2.conf[0])
+            row = [round((bx1 + bx2) / 2 + x_off, 1),
+                   round((by1 + by2) / 2 + y0b, 1), round(c2, 3),
+                   round(bx2 - bx1, 1), round(by2 - by1, 1)]
+            if int(b2.cls[0]) == _CLS_BALL:
+                if c2 >= 0.15:
+                    far_balls.append(row)
+            elif c2 >= conf_far:
+                far_persons.append(row)
+    return far_balls, far_persons
+
+
 def analyze_video(path, detect_every=3, det_w=None, field_top_frac=0.26,
                   weights=None, far_boost=True, far_band_frac=0.58,
                   conf_near=0.2, conf_far=0.1, tracker_cfg=None,
@@ -294,31 +325,9 @@ def analyze_video(path, detect_every=3, det_w=None, field_top_frac=0.26,
             far_balls, far_persons = [], []
             if model_far is not None:
                 # 정사각형 타일: 학습 크기(~640) 분포에 맞고 네이티브 해상도 유지
-                y0b, y1b = int(field_top), int(pano_h * far_band_frac)
-                strip = frame[y0b:y1b]
-                th = strip.shape[0]
-                step = max(1, int(th * 0.85))          # 15% 겹침
-                offs = list(range(0, max(strip.shape[1] - th, 1), step))
-                offs.append(strip.shape[1] - th)       # 우측 끝 보장
-                tiles = [strip[:, x:x + th] for x in offs]
-                imgsz_t = (th + 31) // 32 * 32
-                results = model_far.predict(tiles, imgsz=imgsz_t,
-                                            conf=min(0.15, conf_far),
-                                            classes=[_CLS_BALL, _CLS_PERSON],
-                                            verbose=False)
-                for x_off, r2 in zip(offs, results):
-                    for b2 in r2.boxes:
-                        bx1, by1, bx2, by2 = b2.xyxy[0].tolist()
-                        c2 = float(b2.conf[0])
-                        row = [round((bx1 + bx2) / 2 + x_off, 1),
-                               round((by1 + by2) / 2 + y0b, 1),
-                               round(c2, 3),
-                               round(bx2 - bx1, 1), round(by2 - by1, 1)]
-                        if int(b2.cls[0]) == _CLS_BALL:
-                            if c2 >= 0.15:
-                                far_balls.append(row)
-                        elif c2 >= conf_far:   # 원경 사람 (네이티브 해상도)
-                            far_persons.append(row)
+                far_balls, far_persons = _far_person_tiles(
+                    model_far, frame, int(field_top),
+                    int(pano_h * far_band_frac), conf_far)
             hsv = cv2.cvtColor(small, cv2.COLOR_BGR2HSV)
             bcands = []                            # 이 샘플의 공 후보들
             prow = []
@@ -409,6 +418,85 @@ def analyze_video(path, detect_every=3, det_w=None, field_top_frac=0.26,
             "conf_near": conf_near, "conf_far": conf_far,
             "frames": frames_idx, "balls": balls, "ball_cands": ball_cands,
             "players": players}
+
+
+def augment_far_persons(video_path, analysis, far_band_frac=0.58,
+                        conf_far=0.1, weights=None, progress=None,
+                        cancel=None, log=print):
+    """기존 분석에 원경 타일 '사람' 검출을 **추가** (재분석 아님).
+
+    메인 패스·트래커 tid·기존 검출과 사용자 편집(.ptz.json 의 역할/병합/
+    번호는 tid 로 연결)은 그대로 두고, 원경 밴드만 네이티브 타일로
+    재검출해 기존 박스와 겹치지 않는 사람을 _FarTracker tid(800001+)로
+    병합한다 — 전체 재분석(tid 전부 교체 → 편집 고아화)의 저렴한 대안.
+    이미 800001+ 행이 있으면(재실행) 그 행도 중복 제거 기준에 포함되어
+    이중 추가되지 않는다. analysis 는 제자리 수정, 반환 = 추가 행 수.
+    """
+    from ultralytics import YOLO
+    model = YOLO(str(weights or _DEFAULT_WEIGHTS))
+    cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        raise RuntimeError(f"열 수 없음: {video_path}")
+    pano_h = analysis["pano_h"]
+    pano_w = analysis["pano_w"]
+    fps = float(analysis["fps"])
+    de = int(analysis["detect_every"])
+    y0b = int(analysis.get("field_top_frac", 0.26) * pano_h)
+    y1b = int(pano_h * far_band_frac)
+    frames = analysis["frames"]
+    ftrk = _FarTracker(radius=pano_w * 0.008, max_miss=2.0 * fps / de)
+    import time
+    t0 = time.perf_counter()
+    added = 0
+    k = 0                                  # 다음 처리할 샘플 인덱스
+    i = 0
+    while k < len(frames):
+        if cancel is not None and cancel():
+            break
+        ok = cap.grab()
+        if not ok:
+            break
+        if i == int(frames[k]):
+            ok, frame = cap.retrieve()
+            if not ok:
+                break
+            prow = analysis["players"][k]
+            _fb, far_persons = _far_person_tiles(model, frame, y0b, y1b,
+                                                 conf_far)
+            far_persons.sort(key=lambda p: -p[2])
+            fresh = [fp for fp in far_persons
+                     if not any((fp[0] - p[0]) ** 2 + (fp[1] - p[1]) ** 2
+                                < max(fp[3], 25.0) ** 2 for p in prow)]
+            ftids = ftrk.update(fresh, k)
+            for (fx, fy, fc, fw_, fh_), ftid in zip(fresh, ftids):
+                ty1, ty2 = int(fy - fh_ / 2), int(fy)
+                tx1, tx2 = int(fx - fw_ * 0.3), int(fx + fw_ * 0.3)
+                torso = frame[max(ty1, 0):max(ty2, 1),
+                              max(tx1, 0):max(tx2, 1)]
+                if torso.size:
+                    hm, sm, vm = (cv2.cvtColor(torso, cv2.COLOR_BGR2HSV)
+                                  .reshape(-1, 3).mean(axis=0).tolist())
+                else:
+                    hm = sm = vm = 0.0
+                prow.append([round(fx, 1), round(fy, 1), round(fw_, 1),
+                             round(fh_, 1), int(ftid),
+                             round(hm, 1), round(sm, 1), round(vm, 1)])
+                added += 1
+            k += 1
+            if k % 300 == 0:
+                el = time.perf_counter() - t0
+                log(f"[far] {k}/{len(frames)} 샘플, +{added}행 "
+                    f"({k/max(el,1e-9):.1f}샘플/s)")
+            if progress is not None and k % 30 == 0:
+                progress(k, len(frames), k / max(
+                    time.perf_counter() - t0, 1e-9))
+        i += 1
+    cap.release()
+    analysis["far_augment"] = {"conf_far": conf_far,
+                               "far_band_frac": far_band_frac,
+                               "added": added}
+    log(f"[far] 원경 보강 완료: +{added}행 (기존 트랙릿·편집 보존)")
+    return added
 
 
 # 역할 번호: classify_teams 반환값과 GUI 색상 테이블이 공유하는 규약.
