@@ -670,10 +670,12 @@ def chain_homography(video_path, f0, f1, det_w=1920, every_s=0.5):
 
 
 def transfer_points(H, pts):
-    """H 로 픽셀 점 (N,2) 이송."""
+    """H 로 픽셀 점 (N,2) 이송. 퇴화(w≈0, 지평선 부근)면 NaN/inf —
+    호출부가 np.isfinite 로 걸러야 한다."""
     p = np.asarray(pts, np.float64).reshape(-1, 2)
     q = (H @ np.hstack([p, np.ones((len(p), 1))]).T).T
-    return q[:, :2] / q[:, 2:3]
+    with np.errstate(divide="ignore", invalid="ignore"):
+        return q[:, :2] / q[:, 2:3]
 
 
 # ---------------------------------------------------------------- 궤적 번들

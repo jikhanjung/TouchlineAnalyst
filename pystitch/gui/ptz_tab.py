@@ -4351,6 +4351,8 @@ class PtzTab(QWidget):
                 tp = self._lm_transferred.get(k) if rotcam else None
                 transferred = tp is not None and kf is not None and int(kf) != int(f)
                 px = tp if tp is not None else pt
+                if not (np.isfinite(px[0]) and np.isfinite(px[1])):
+                    continue              # 퇴화 이송 방어 (int(NaN) 크래시)
                 q = (int(px[0] * sc), int(px[1] * sc))
                 if rotcam:
                     invalid = self._lm_invalid_here(k, f)
@@ -4386,6 +4388,8 @@ class PtzTab(QWidget):
                             continue
                         from ..core.rotcam import transfer_points
                         q2 = transfer_points(H, [[lx, ly]])[0]
+                        if not np.isfinite(q2).all():
+                            continue      # 퇴화 이송 방어
                     cv2.circle(frame, (int(q2[0] * sc), int(q2[1] * sc)),
                                max(3, int(7 * sc)), lcol, -1)
                     cv2.circle(frame, (int(q2[0] * sc), int(q2[1] * sc)),
@@ -7125,6 +7129,8 @@ class PtzTab(QWidget):
                     if H is None:
                         continue
                     p = [float(v) for v in transfer_points(H, [p])[0]]
+                    if not all(np.isfinite(v) for v in p):
+                        continue          # 퇴화 이송 방어
                 line_px.append(p)
                 line_fam.append(fam)
         # 공선 랜드마크 → 소속 라인 point-to-line 구속 (LM_LINE_FAM):
@@ -7436,6 +7442,8 @@ class PtzTab(QWidget):
                         if H is None:
                             continue
                         q = [float(v) for v in transfer_points(H, [q])[0]]
+                        if not all(np.isfinite(v) for v in q):
+                            continue      # 퇴화 이송 방어
                     lp.append(q)
                     lf.append(famk)
             if lp:
@@ -7572,7 +7580,10 @@ class PtzTab(QWidget):
             H = self._rc_H(src, cur)
             if H is not None:
                 q = transfer_points(H, [px])[0]
-                return [float(q[0]), float(q[1])], src
+                # 체인 H 가 퇴화하면(점이 그 프레임 지평선 부근) NaN/inf —
+                # 이송 실패로 보고 다음 소스 시도 (int(NaN) 크래시 방지)
+                if np.isfinite(q).all():
+                    return [float(q[0]), float(q[1])], src
         return None
 
     def _rc_transfer_landmarks(self):
