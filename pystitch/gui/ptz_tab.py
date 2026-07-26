@@ -7738,6 +7738,11 @@ class PtzTab(QWidget):
         self._pcache_id = None           # 선수 목록 캐시 무효화
         self._refresh_player_list()
         self._redraw()
+        # 재검출 성공 → 곧바로 ±4s 추적 확장 (사용자 방향: 두 번
+        # 우클릭하지 않게). 백그라운드 워커라 아래 역할 메뉴(블로킹)
+        # 를 띄우기 전에 시작해 메뉴 고르는 동안 진행된다. 한 프레임만
+        # 필요하면 전파된 샘플을 개별 삭제하면 된다.
+        self._propagate(int(f), cx, cy, "person", ctx=tid)
         # 바로 사람 지정 메뉴 — 팀 선택 아래 번호까지 한 번에 (사용자
         # 요청: 재검출 → 팀+번호 지정이 한 흐름). 기존 선수 우클릭
         # 메뉴와 동일 구조 (_add_num_items 재사용).
