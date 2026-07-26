@@ -18,6 +18,7 @@ import numpy as np
 CENTER_CIRCLE_R = 9.15
 PEN_HALF_W = 20.16      # 페널티박스 반폭 (40.32m)
 PEN_DEPTH = 16.5        # 페널티박스 깊이
+GOAL_HALF_W = 3.66      # 골대 반폭 (7.32m) — 포스트 밑동은 골라인 위 z=0
 
 # (키, 표시 이름, 필수 여부) — 리스트 순서 = 권장 찍기 순서.
 # 1단계(최외곽 선 위, ~10점): 코너 4 → 중앙선×사이드라인 2 → 가까운
@@ -25,27 +26,37 @@ PEN_DEPTH = 16.5        # 페널티박스 깊이
 # 초기 카메라 모델의 휴리스틱 매칭이 안정적이고, 이후 내부 점들은
 # 이미 피팅된 모델로 정확히 매칭된다. 2단계: 센터서클·페널티박스 내부.
 LANDMARKS = [
+    # 순서 = 왼쪽→오른쪽 찍기 동선 (사용자 방향): 왼쪽 코너 → 왼쪽 골대
+    # → 왼쪽 페널티박스 → 중앙선 → 오른쪽은 왼쪽의 반대 순서.
+    # 컨텍스트 메뉴·경기장 탭 목록·찍기 모드 제안이 이 순서를 따른다.
     ("corner_far_l",  "먼쪽 왼쪽 코너", True),
-    ("corner_far_r",  "먼쪽 오른쪽 코너", True),
     ("corner_near_l", "가까운 왼쪽 코너", False),
-    ("corner_near_r", "가까운 오른쪽 코너", False),
+    # 골포스트 밑동 — 코너·페널티박스 교차점과 같은 골라인 위 (공선) —
+    # 가까운 코너가 안 보여도 골라인/엔드라인 방향을 강하게 구속한다.
+    ("goal_l_far",  "왼쪽 골포스트 밑동 (먼쪽)", False),
+    ("goal_l_near", "왼쪽 골포스트 밑동 (가까운쪽)", False),
+    ("pen_l_far",   "왼쪽 골라인 × 페널티박스 (먼쪽)", False),
+    ("pen_l_near",  "왼쪽 골라인 × 페널티박스 (가까운쪽)", False),
+    ("pen_l_box_far",  "왼쪽 페널티박스 안 모서리 (먼쪽)", False),
+    ("pen_l_box_near", "왼쪽 페널티박스 안 모서리 (가까운쪽)", False),
     ("half_far",      "중앙선 × 먼쪽 사이드라인", False),
+    ("circle_far",  "센터서클 × 중앙선 (먼쪽)", False),
+    ("circle_near", "센터서클 × 중앙선 (가까운쪽)", False),
     ("half_near",     "중앙선 × 가까운 사이드라인", False),
+    ("pen_r_box_far",  "오른쪽 페널티박스 안 모서리 (먼쪽)", False),
+    ("pen_r_box_near", "오른쪽 페널티박스 안 모서리 (가까운쪽)", False),
+    ("pen_r_far",   "오른쪽 골라인 × 페널티박스 (먼쪽)", False),
+    ("pen_r_near",  "오른쪽 골라인 × 페널티박스 (가까운쪽)", False),
+    ("goal_r_far",  "오른쪽 골포스트 밑동 (먼쪽)", False),
+    ("goal_r_near", "오른쪽 골포스트 밑동 (가까운쪽)", False),
+    ("corner_far_r",  "먼쪽 오른쪽 코너", True),
+    ("corner_near_r", "가까운 오른쪽 코너", False),
+    # 보조: 센터서클 좌우 끝 + 위치 미지의 '선 위 점'
+    ("circle_l",    "센터서클 왼쪽 끝", False),
+    ("circle_r",    "센터서클 오른쪽 끝", False),
     ("sideline_near_l", "가까운 사이드라인 위 왼쪽 (선 위 아무 점)", False),
     ("sideline_near_r", "가까운 사이드라인 위 오른쪽 (선 위 아무 점)", False),
     ("center_near",   "중앙선 위 가까운 점 (선 위 아무 점)", False),
-    ("pen_l_far",   "왼쪽 골라인 × 페널티박스 (먼쪽)", False),
-    ("pen_l_near",  "왼쪽 골라인 × 페널티박스 (가까운쪽)", False),
-    ("pen_r_far",   "오른쪽 골라인 × 페널티박스 (먼쪽)", False),
-    ("pen_r_near",  "오른쪽 골라인 × 페널티박스 (가까운쪽)", False),
-    ("circle_far",  "센터서클 × 중앙선 (먼쪽)", False),
-    ("circle_near", "센터서클 × 중앙선 (가까운쪽)", False),
-    ("circle_l",    "센터서클 왼쪽 끝", False),
-    ("circle_r",    "센터서클 오른쪽 끝", False),
-    ("pen_l_box_far",  "왼쪽 페널티박스 안 모서리 (먼쪽)", False),
-    ("pen_l_box_near", "왼쪽 페널티박스 안 모서리 (가까운쪽)", False),
-    ("pen_r_box_far",  "오른쪽 페널티박스 안 모서리 (먼쪽)", False),
-    ("pen_r_box_near", "오른쪽 페널티박스 안 모서리 (가까운쪽)", False),
 ]
 
 # 위치를 모르는 '선 위의 점' 랜드마크: 카메라 앞 중앙선-사이드라인 교차점이
@@ -77,6 +88,10 @@ def landmark_positions(length=105.0, width=68.0, circle_r=CENTER_CIRCLE_R):
         "pen_l_near":    (-hl, -PEN_HALF_W),
         "pen_r_far":     ( hl,  PEN_HALF_W),
         "pen_r_near":    ( hl, -PEN_HALF_W),
+        "goal_l_far":    (-hl,  GOAL_HALF_W),
+        "goal_l_near":   (-hl, -GOAL_HALF_W),
+        "goal_r_far":    ( hl,  GOAL_HALF_W),
+        "goal_r_near":   ( hl, -GOAL_HALF_W),
         "pen_l_box_far":  (-hl + PEN_DEPTH,  PEN_HALF_W),
         "pen_l_box_near": (-hl + PEN_DEPTH, -PEN_HALF_W),
         "pen_r_box_far":  ( hl - PEN_DEPTH,  PEN_HALF_W),

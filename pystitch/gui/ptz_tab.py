@@ -68,7 +68,9 @@ LANDMARK_TAGS = {"corner_far_l": "FL", "corner_far_r": "FR",
                  "pen_l_box_far": "BLF", "pen_l_box_near": "BLN",
                  "pen_r_box_far": "BRF", "pen_r_box_near": "BRN",
                  "center_near": "CM",
-                 "circle_l": "CL", "circle_r": "CR"}
+                 "circle_l": "CL", "circle_r": "CR",
+                 "goal_l_far": "GLF", "goal_l_near": "GLN",
+                 "goal_r_far": "GRF", "goal_r_near": "GRN"}
 
 
 def _dashed_circle(img, center, radius, color, thickness=2, dash_deg=18):
