@@ -1803,6 +1803,8 @@ class PtzTab(QWidget):
         self.player_nums: dict[int, str] = {}  # {대표 tid: 등번호}
         self.rosters: dict[int, list] = {}     # {팀: ["7 이름", ...]} 명단
         self.hidden_players: set[int] = set()  # 숨긴 대표 tid (관중·오인식)
+        self._outfield: set[int] = set()  # 캘리브 기반 장외 트랙릿 (자동·비파괴)
+        self._foot_cache = None           # (analysis id, tids, 발밑 px) — 장외 판정
         self._rb = None                   # 좌드래그 러버밴드 (사람 다중 선택)
         self._pane_sel: set[int] = set()  # 러버밴드로 고른 대표 tid
         self.field_points: dict[str, list] = {}   # {랜드마크키: [x, y]}
@@ -2096,6 +2098,10 @@ class PtzTab(QWidget):
         self.check_radar = QCheckBox("레이더")
         self.check_radar_smooth = QCheckBox("스무딩")
         self.check_radar_smooth.setToolTip("미니맵 위치 지터 완화 (EMA)")
+        self.check_infield = QCheckBox("장외 숨김")
+        self.check_infield.setToolTip(
+            "경기장 캘리브레이션 기반 — 발밑이 피치 밖인 사람(관중·"
+            "대기선수)을 표시·목록·레이더·크롭 계획에서 자동 제외 (비파괴)")
         ov = QVBoxLayout(self.pane)
         ov.setContentsMargins(8, 8, 8, 8)
         ov_row = QHBoxLayout()
@@ -2107,12 +2113,18 @@ class PtzTab(QWidget):
         ov_row.addWidget(self._lbl_title)
         ov_row.addStretch(1)
         for cb in (self.check_players, self.check_ball, self.check_crop,
-                   self.check_radar, self.check_radar_smooth):
+                   self.check_radar, self.check_radar_smooth,
+                   self.check_infield):
             cb.setChecked(True)
             cb.setStyleSheet(
                 "QCheckBox { color: white; background: rgba(20,20,20,150);"
                 " padding: 2px 8px; border-radius: 4px; }")
             ov_row.addWidget(cb)
+        # 장외 숨김: 저장된 설정 복원 + 토글 시 장외 재판정·계획 갱신
+        self.check_infield.setChecked(
+            QSettings("PyStitch360", "PyStitch360")
+            .value("ptz_infield_only", "true") == "true")
+        self.check_infield.toggled.connect(self._infield_toggled)
         # 멀티캠 카메라/모드 바 (경기 열면 채워짐 — _rebuild_mc_bar)
         self._mc_row = QHBoxLayout()
         self._mc_row.addStretch(1)
@@ -3010,6 +3022,8 @@ class PtzTab(QWidget):
         self.player_nums = {}
         self.rosters = {}
         self.hidden_players = set()
+        self._outfield = set()
+        self._foot_cache = None
         self._pane_sel = set()
         self._rb = None
         self._ar_side_cache = {}
@@ -4050,6 +4064,27 @@ class PtzTab(QWidget):
         radar_pts = []
         if si is not None:
             prow = self._players_row(si)
+            # rotcam 장외 숨김: 트랙릿 일괄 판정(파노라마) 대신 현재
+            # 프레임 자세로 발밑을 지면 투영해 피치 밖을 거른다 — 자세를
+            # 못 푼 프레임은 필터 없이 전부 표시 (엉뚱하게 숨기느니 안전).
+            if (getattr(self, "_is_rotcam", False)
+                    and getattr(self, "_rc_calib", None) is not None
+                    and self.check_infield.isChecked() and prow):
+                pose = self._rc_current_pose(int(f))
+                if pose is not None:
+                    from ..core.rotcam import pixel_to_field
+                    ok_rows = [pp for pp in prow if len(pp) >= 4]
+                    if ok_rows:
+                        fxy = pixel_to_field(
+                            pose["K"], pose["R"],
+                            np.asarray(self._rc_calib["cam_pos"], float),
+                            [(pp[0], pp[1] + pp[3] / 2.0) for pp in ok_rows])
+                        hl = self.field_size[0] / 2.0 + self._INFIELD_MARGIN
+                        hw = self.field_size[1] / 2.0 + self._INFIELD_MARGIN
+                        drop = {id(pp) for pp, (gx, gy) in zip(ok_rows, fxy)
+                                if not (np.isfinite(gx) and abs(gx) <= hl
+                                        and abs(gy) <= hw)}
+                        prow = [pp for pp in prow if id(pp) not in drop]
             sel = self.trackbar.selected
             sel_rep = (self._rep(sel[1]) if sel and sel[0] == "player"
                        else None)
@@ -4708,9 +4743,9 @@ class PtzTab(QWidget):
         if self._plan_worker is not None and self._plan_worker.isRunning():
             self._plan_timer.start()      # 진행 중이면 잠시 뒤 재시도
             return
+        excl = self._person_excluded()    # 수동 숨김 + 자동 장외
         hidden = {t for t in self._pspans
-                  if self._rep(t) in self.hidden_players} \
-            if self.hidden_players else set()
+                  if self._rep(t) in excl} if excl else set()
         w = PlanWorker(self.analysis, [tuple(k) for k in self.keyframes],
                        [tuple(r) for r in self.ignores],
                        self.combo_mode.currentIndex() == 1, linked=self._linked,
@@ -4844,6 +4879,10 @@ class PtzTab(QWidget):
             if self.roles and self.analysis is not None:
                 self._teams = classify_teams(self.analysis, roles=self.roles,
                                              feats=self._team_feats())
+            self._update_outfield()       # 병합 대표 확정 후 장외 판정
+            if self._outfield:
+                self.log(f"[ptz] 장외 트랙릿 {len(self._outfield)}개 자동 "
+                         "숨김 (경기장 캘리브 기반 — '장외 숨김' 체크 해제로 표시)")
             n_team = sum(1 for v in self._teams.values() if v < 2)
             self.log(f"[ptz] 트랙 연결 완료: {len(linked['tracks'])}개"
                      + (f", 팀 분류 선수 ID {n_team}개" if self._teams else
@@ -5038,6 +5077,70 @@ class PtzTab(QWidget):
         self._plan_dirty()
         self._redraw()
         self.log(f"[ptz] #{rep} 복원 (숨김 해제)")
+
+    # -------------------------------------- 장외 자동 숨김 (경기장 안만 인식)
+    _INFIELD_MARGIN = 2.0                 # 피치 경계 여유 (m) — 스로인 등
+
+    def _update_outfield(self):
+        """트랙릿별 발밑 필드 좌표 과반이 피치(+여유) 밖이면 장외 판정.
+
+        파노라마 전용 (고정 캘리브 → 전 샘플 일괄 투영, 표본 상한
+        ~4천 샘플). rotcam 은 프레임별 자세가 필요해 _redraw 가 현재
+        프레임만 거른다. 비파괴 — hidden_players 처럼 표시·목록·레이더·
+        크롭 계획·OCR 후보에서만 제외, 분석 원본은 그대로."""
+        self._outfield = set()
+        if (self.analysis is None or self._field_calib is None
+                or getattr(self, "_is_rotcam", False)
+                or not getattr(self, "check_infield", None)
+                or not self.check_infield.isChecked()):
+            return
+        cache = getattr(self, "_foot_cache", None)
+        if cache is None or cache[0] != id(self.analysis):
+            tids, pts = [], []
+            players = self.analysis["players"]
+            step = max(1, len(players) // 4000)
+            for si in range(0, len(players), step):
+                for p in players[si]:
+                    if len(p) >= 5 and p[4] >= 0:
+                        tids.append(int(p[4]))
+                        pts.append((float(p[0]),
+                                    float(p[1]) + float(p[3]) / 2.0))
+            cache = self._foot_cache = (
+                id(self.analysis), np.asarray(tids, int),
+                np.asarray(pts, float).reshape(-1, 2))
+        _aid, tids, pts = cache
+        if not len(tids):
+            return
+        uniq, inv = np.unique(tids, return_inverse=True)
+        reps = np.asarray([self._rep(int(t)) for t in uniq])[inv]
+        fxy = pano_to_field(self._field_calib, pts)
+        hl = self.field_size[0] / 2.0 + self._INFIELD_MARGIN
+        hw = self.field_size[1] / 2.0 + self._INFIELD_MARGIN
+        inside = (np.isfinite(fxy).all(axis=1)
+                  & (np.abs(fxy[:, 0]) <= hl) & (np.abs(fxy[:, 1]) <= hw))
+        for r in np.unique(reps):
+            m = reps == r
+            # 과반이 밖(수평선 위 포함)이면 장외 — 경계 선수는 살아남는다
+            if np.count_nonzero(inside[m]) * 2 < np.count_nonzero(m):
+                self._outfield.add(int(r))
+
+    def _person_excluded(self):
+        """표시·목록·계획에서 제외할 대표 tid 집합 (수동 숨김 + 자동 장외)."""
+        return (self.hidden_players | self._outfield
+                if self._outfield else self.hidden_players)
+
+    def _infield_toggled(self, on):
+        QSettings("PyStitch360", "PyStitch360").setValue(
+            "ptz_infield_only", "true" if on else "false")
+        self._update_outfield()
+        self._refresh_team_label()
+        self._refresh_player_list()
+        self._plan_dirty()                # 크롭 계획도 장외 제외 반영
+        self._redraw()
+        if self.analysis is not None:
+            self.log(f"[ptz] 장외 숨김 {'켬' if on else '끔'}"
+                     + (f" — 장외 트랙릿 {len(self._outfield)}개"
+                        if on and self._outfield else ""))
 
     # ------------------------------------------------------ 등번호
     def _num_of(self, tid):
@@ -5794,8 +5897,12 @@ class PtzTab(QWidget):
             self.log("[ocr] 취소 요청")
             return
         from ..core.ocr import collect_ocr_candidates
+        # 장외 트랙릿(관중 등)은 OCR 후보에서도 제외 — 역할을 -1 로 위장
+        role_of = ((lambda t: -1 if self._rep(t) in self._outfield
+                    else self._role_of(t))
+                   if self._outfield else self._role_of)
         picked = collect_ocr_candidates(self.analysis, calib,
-                                        self._role_of, self._rep)
+                                        role_of, self._rep)
         if not picked:
             gate = ("박스 높이 ≥90px" if calib is None
                     else "필드 Y<0, 박스 높이 ≥90px")
@@ -6939,6 +7046,7 @@ class PtzTab(QWidget):
                 self.field_points, self.pano_w, self.pano_h,
                 length=self.field_size[0], width=self.field_size[1],
                 line_points=self.line_points)
+        self._update_outfield()           # 캘리브 변경 → 장외 재판정
         if getattr(self, "_is_rotcam", False):
             rc = getattr(self, "_rc_calib", None)
             npos = sum(1 for k in self.field_points
@@ -6999,11 +7107,12 @@ class PtzTab(QWidget):
             return []
         rows = list(self.analysis["players"][si]) \
             + self.extra_players.get(int(si), [])
-        if not self.hidden_players:
+        excl = self._person_excluded()    # 수동 숨김 + 자동 장외
+        if not excl:
             return rows
         return [p for p in rows
                 if len(p) < 5 or p[4] < 0
-                or self._rep(int(p[4])) not in self.hidden_players]
+                or self._rep(int(p[4])) not in excl]
 
     def _hidden_player_at(self, x, y):
         """(x, y) 아래 '숨긴' 사람의 대표 tid (없으면 None) — 회색 박스 복원용."""
