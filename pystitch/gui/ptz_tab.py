@@ -5773,11 +5773,17 @@ class PtzTab(QWidget):
             f"선수 {len(r['rows'])}명 (players.md 요약표 포함)")
 
     def run_jersey_ocr(self):
-        """분석 메뉴: 등번호 OCR — 근측 절반 선수만 (devlog 040)."""
+        """분석 메뉴: 등번호 OCR — 근측(큰 박스) 선수 (devlog 040).
+
+        rotcam(AX700 등)은 파노라마 필드 캘리브(_field_calib)가 없다 —
+        calib=None 으로 넘기면 collect_ocr_candidates 가 필드 근/원 게이트
+        대신 박스 높이 게이트만 쓴다(원경 선수는 작아서 대부분 걸러짐)."""
         if self.analysis is None or self.pano_path is None:
             QMessageBox.information(self, "등번호 OCR", "먼저 분석이 필요합니다.")
             return
-        if self._field_calib is None:
+        rotcam = getattr(self, "_is_rotcam", False)
+        calib = self._field_calib
+        if calib is None and not rotcam:
             QMessageBox.information(self, "등번호 OCR",
                                     "경기장 캘리브레이션이 필요합니다 "
                                     "(근측 게이트에 필드 좌표 사용).")
@@ -5788,12 +5794,13 @@ class PtzTab(QWidget):
             self.log("[ocr] 취소 요청")
             return
         from ..core.ocr import collect_ocr_candidates
-        picked = collect_ocr_candidates(self.analysis, self._field_calib,
+        picked = collect_ocr_candidates(self.analysis, calib,
                                         self._role_of, self._rep)
         if not picked:
+            gate = ("박스 높이 ≥90px" if calib is None
+                    else "필드 Y<0, 박스 높이 ≥90px")
             QMessageBox.information(
-                self, "등번호 OCR",
-                "근측 후보가 없습니다 (필드 Y<0, 박스 높이 ≥90px).")
+                self, "등번호 OCR", f"근측 후보가 없습니다 ({gate}).")
             return
         n_rep = len({r for _, _, r in picked})
         if QMessageBox.question(
