@@ -1929,12 +1929,12 @@ class PtzTab(QWidget):
 
         pts = [(tid|None, x, y, role)]. tid 기준 상태 유지, 시간 점프
         (>3s)면 리셋. tid 없는 점(주입 검출)은 스무딩 없이 통과.
-        반환: ([(x, y, role)], ball).
+        반환: ([(tid|None, x, y, role)], ball) — tid 는 등번호 표시용.
         """
         if not self.check_radar_smooth.isChecked():
             self._radar_smooth = {}
             self._radar_smooth_f = None
-            return [(x, y, r) for _t, x, y, r in pts], ball_g
+            return list(pts), ball_g
         if self._radar_smooth_f is None \
                 or abs(f - self._radar_smooth_f) > 3 * self.fps:
             self._radar_smooth = {}
@@ -1945,7 +1945,7 @@ class PtzTab(QWidget):
         seen = set()
         for tid, x, y, role in pts:
             if tid is None:
-                out.append((x, y, role))
+                out.append((None, x, y, role))
                 continue
             p = st.get(tid)
             if p is None:
@@ -1954,7 +1954,7 @@ class PtzTab(QWidget):
                 p[0] += a * (x - p[0])
                 p[1] += a * (y - p[1])
             seen.add(tid)
-            out.append((p[0], p[1], role))
+            out.append((tid, p[0], p[1], role))
         if ball_g is not None:
             p = st.get("__ball__")
             if p is None:
@@ -1977,10 +1977,17 @@ class PtzTab(QWidget):
         경로 draw_radar_panel 은 그대로).
         """
         from PyQt6.QtGui import QImage, QPainter, QPixmap
+        # 등번호 지정된 트랙릿 → {tid: 번호} (패널이 크면 점 옆에 표시)
+        nums = {}
+        for p in pts:
+            if len(p) == 4 and p[0] is not None:
+                n = self._num_of(int(p[0]))
+                if n and n.isascii():
+                    nums[int(p[0])] = n
         radar = {"frames": [0], "points": [pts], "balls": [ball_g],
                  "length": float(self.field_size[0]),
                  "width": float(self.field_size[1]),
-                 "palette": self._radar_palette}
+                 "palette": self._radar_palette, "nums": nums}
         pw = max(160, self.pane.width() // 5) & ~1
         if self.pane.width() < 320:
             self._radar_lbl.hide()

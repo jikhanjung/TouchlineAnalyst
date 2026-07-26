@@ -1315,14 +1315,37 @@ def draw_radar_panel(radar, si, panel_w):
     cv2.line(img, px(0, -Wd / 2), px(0, Wd / 2), wcol, lw)
     cv2.circle(img, px(0, 0), int(round(9.15 * s)), wcol, lw)
     pal = radar.get("palette", {})
+    # 등번호 표시 (radar["nums"] = {tid: "58"}): 패널이 적당히 클 때만 —
+    # 작으면 겹쳐서 오히려 안 보인다 (사용자 방향). 점은 (X,Y,role) 또는
+    # (tid,X,Y,role) 둘 다 허용 (내보내기 경로는 tid 없는 3-튜플).
+    nums = radar.get("nums") or {}
+    show_nums = bool(nums) and panel_w >= 320
+    fs = 0.32 * panel_w / 320.0
     r_dot = max(2, panel_w // 110)
-    for X, Y, role in radar["points"][si]:
-        cv2.circle(img, px(X, Y), r_dot,
+    labels = []
+    for p in radar["points"][si]:
+        tid = None
+        if len(p) == 4:
+            tid, X, Y, role = p
+        else:
+            X, Y, role = p
+        q = px(X, Y)
+        cv2.circle(img, q, r_dot,
                    tuple(int(v) for v in pal.get(role, (160, 160, 160))), -1)
+        if show_nums and tid is not None:
+            n = nums.get(int(tid))
+            if n:
+                labels.append((q, str(n)))
     if radar["balls"][si] is not None:
         q = px(*radar["balls"][si])
         cv2.circle(img, q, r_dot + 2, (30, 30, 30), 2)   # 외곽선 — 대비
         cv2.circle(img, q, r_dot + 1, (0, 140, 255), -1)   # 공 = 주황 (BGR)
+    for (qx, qy), n in labels:            # 텍스트는 점 위에 (마지막)
+        org = (qx + r_dot + 1, qy - r_dot + 1)
+        cv2.putText(img, n, org, cv2.FONT_HERSHEY_SIMPLEX, fs,
+                    (20, 20, 20), 2)      # 어두운 외곽선
+        cv2.putText(img, n, org, cv2.FONT_HERSHEY_SIMPLEX, fs,
+                    (240, 240, 240), 1)
     return img
 
 
