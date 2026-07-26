@@ -1317,6 +1317,11 @@ def draw_radar_panel(radar, si, panel_w):
     cv2.rectangle(img, px(-L / 2, Wd / 2), px(L / 2, -Wd / 2), wcol, lw)
     cv2.line(img, px(0, -Wd / 2), px(0, Wd / 2), wcol, lw)
     cv2.circle(img, px(0, 0), int(round(9.15 * s)), wcol, lw)
+    # 페널티에리어 (양쪽) — 위치 파악 기준선 (사용자 방향)
+    from .field import PEN_DEPTH, PEN_HALF_W
+    pw_, pd_ = min(PEN_HALF_W, Wd / 2), min(PEN_DEPTH, L / 2)
+    cv2.rectangle(img, px(-L / 2, pw_), px(-L / 2 + pd_, -pw_), wcol, lw)
+    cv2.rectangle(img, px(L / 2 - pd_, pw_), px(L / 2, -pw_), wcol, lw)
     pal = radar.get("palette", {})
     # 등번호 표시 (radar["nums"] = {tid: "58"}): 패널이 적당히 클 때만 —
     # 작으면 겹쳐서 오히려 안 보인다 (사용자 방향). 점은 (X,Y,role) 또는
@@ -1506,9 +1511,10 @@ def analysis_summary(analysis_path, analysis, log=print):
     if key is not None and cp.exists():
         try:
             d = _json.loads(cp.read_text())
-            if d.get("key") == key:
+            if d.get("key") == key and "segs" in d:   # segs 없는 구 캐시 무효
                 return {"spans": {int(t): v
                                   for t, v in d["spans"].items()},
+                        "segs": {int(t): v for t, v in d["segs"].items()},
                         "colors": {int(t): tuple(v)
                                    for t, v in d["colors"].items()},
                         "foot_med": {int(t): tuple(v)
@@ -1516,7 +1522,12 @@ def analysis_summary(analysis_path, analysis, log=print):
         except (OSError, ValueError, KeyError) as e:
             log(f"[cache] 요약 캐시 무시: {e}")
     frames = analysis["frames"]
+    # 검출 세그먼트: 트랙릿 내부 공백(>2s)에서 분절 — 트래커가 오래
+    # 사라진 사람에게 같은 ID 를 재부착하면 스팬 통짜 막대가 '없는데
+    # 있는 것처럼' 보인다 (타임라인이 세그먼트 단위로 그리게).
+    gapf = 2.0 * float(analysis.get("fps") or 30.0)
     spans: dict[int, list] = {}
+    segs: dict[int, list] = {}
     feet: dict[int, list] = {}
     for si, prow in enumerate(analysis["players"]):
         f = int(frames[si])
@@ -1526,7 +1537,12 @@ def analysis_summary(analysis_path, analysis, log=print):
                 e = spans.get(t)
                 if e is None:
                     spans[t] = [f, f, 1]
+                    segs[t] = [[f, f]]
                 else:
+                    if f - e[1] > gapf:
+                        segs[t].append([f, f])
+                    else:
+                        segs[t][-1][1] = f
                     e[1] = f
                     e[2] += 1
                 feet.setdefault(t, []).append((pl[0], pl[1] + pl[3] / 2.0))
@@ -1539,12 +1555,14 @@ def analysis_summary(analysis_path, analysis, log=print):
             cp.write_text(_json.dumps(
                 {"key": key,
                  "spans": {str(t): v for t, v in spans.items()},
+                 "segs": {str(t): v for t, v in segs.items()},
                  "colors": {str(t): list(v) for t, v in colors.items()},
                  "foot_med": {str(t): list(v)
                               for t, v in foot_med.items()}}))
         except OSError as e:
             log(f"[cache] 요약 캐시 저장 실패: {e}")
-    return {"spans": spans, "colors": colors, "foot_med": foot_med}
+    return {"spans": spans, "segs": segs, "colors": colors,
+            "foot_med": foot_med}
 
 
 def link_ball_tracks_cached(analysis_path, analysis, ball_conf=0.25,

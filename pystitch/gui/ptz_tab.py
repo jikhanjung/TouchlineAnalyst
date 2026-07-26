@@ -331,8 +331,13 @@ class TimelineView(QWidget):
         self._clamp_view()
         self._emit_view()
 
-    def set_players(self, players, numbers=None, reps=None):
+    def set_players(self, players, numbers=None, reps=None, segments=None):
         """{tid: (f0, f1, role)} → 레인별 서브행 배치.
+
+        segments = {tid: [[s0,s1], ...]} — 트랙릿 내부 공백(>2s)으로
+        분절된 실제 검출 구간. 있으면 막대를 세그먼트 단위로 그려
+        '검출이 없는데 흰 막대'로 보이던 통짜 스팬 문제를 없앤다
+        (사용자 방향). 공백은 그룹 밴드(반투명)로만 표시.
 
         번호가 부여된(=신원 확인된) 트랙릿은 **번호별 전용 행**으로 맨
         위에 — 같은 번호(같은 사람)의 조각들이 한 줄에 이어져 보이고,
@@ -343,6 +348,7 @@ class TimelineView(QWidget):
         """
         numbers = numbers or {}
         reps = reps or {}
+        segments = segments or {}
         self._pnum = dict(numbers)
         self._prep = dict(reps)
         rep_of = lambda t: reps.get(t, t)
@@ -382,9 +388,16 @@ class TimelineView(QWidget):
                     ends.append(g1)
             for rep, members in groups.items():
                 si = row_of[rep]
+                holes = False
                 for f0, f1, tid, role in members:
-                    out.append((tid, f0, f1, role, si))
-                if len(members) > 1:           # 병합 그룹 밴드
+                    sg = segments.get(tid)
+                    if sg and len(sg) > 1:     # 내부 공백 → 세그먼트 막대
+                        holes = True
+                        for s0, s1 in sg:
+                            out.append((tid, s0, s1, role, si))
+                    else:
+                        out.append((tid, f0, f1, role, si))
+                if len(members) > 1 or holes:  # 병합 그룹/내부 공백 밴드
                     g0 = min(m[0] for m in members)
                     g1 = max(m[1] for m in members)
                     self._group_bands.append((lane, si, g0, g1,
@@ -5006,13 +5019,32 @@ class PtzTab(QWidget):
                 self.pano_path.with_suffix(".analysis.json")
                 if self.pano_path else "", self.analysis, log=self.log)
             spans = dict(summ["spans"])
+            segs = {t: [list(s) for s in v]
+                    for t, v in summ.get("segs", {}).items()}
             frames = self.analysis["frames"]
-            for si, rows in self.extra_players.items():   # 수동 검출 포함
+            # 수동 검출 포함 — 예전엔 행마다 스팬을 '덮어써' 추적 확장
+            # (±4s 주입) 결과가 마지막 1프레임으로 붕괴했다. 프레임을
+            # 모아 min/max/개수 + 세그먼트(공백>2s 분절)로 집계해
+            # 확장 결과가 타임라인 트랙릿에 그대로 반영되게 (사용자 방향).
+            ex: dict[int, list] = {}
+            for si, rows in self.extra_players.items():
                 if si < len(frames):
                     f = int(frames[si])
                     for p in rows:
-                        spans[int(p[4])] = [f, f, 1]
+                        ex.setdefault(int(p[4]), []).append(f)
+            gapf = 2.0 * self.fps
+            for t, fl in ex.items():
+                fl.sort()
+                spans[t] = [fl[0], fl[-1], len(fl)]
+                sg = [[fl[0], fl[0]]]
+                for f in fl[1:]:
+                    if f - sg[-1][1] > gapf:
+                        sg.append([f, f])
+                    else:
+                        sg[-1][1] = f
+                segs[t] = sg
             self._pspans = spans
+            self._psegs = segs
             if self._pcolors_id != id(self.analysis):
                 self._pcolors = summ["colors"]
                 self._pcolors_id = id(self.analysis)
@@ -5624,7 +5656,8 @@ class PtzTab(QWidget):
             {t: (spans[t][0], spans[t][1], self._role_of(t)) for t in spans},
             numbers={self._rep(t): self.player_nums[self._rep(t)]
                      for t in spans if self._rep(t) in self.player_nums},
-            reps={t: self._rep(t) for t in spans})
+            reps={t: self._rep(t) for t in spans},
+            segments=getattr(self, "_psegs", None))
 
     def _nearest_det_frame(self, tid, fclick=None):
         """트랙릿(대표 그룹)의 검출 중 fclick 에 가장 가까운 프레임.
