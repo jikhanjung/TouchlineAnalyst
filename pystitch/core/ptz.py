@@ -496,9 +496,12 @@ def propagate_seed(pano_path, analysis, f0, x0, y0, kind="ball",
         misses = 0
         rng = range(si0, min(si0 + n_ext + 1, len(frames))) \
             if direction == 1 else range(si0 - 1, max(si0 - n_ext - 1, -1), -1)
-        for si in rng:
+        for n_i, si in enumerate(rng):
             if cancel is not None and cancel():
                 break
+            if n_i and n_i % 10 == 0:     # 진행 표시 (수십 초 걸릴 수 있음)
+                log(f"[seed] {'순' if direction == 1 else '역'}방향 "
+                    f"{n_i}/{n_ext} 샘플…")
             F = int(frames[si])
             if direction == 1 and 0 <= F - pos_f <= 90:
                 for _ in range(F - pos_f - 1):

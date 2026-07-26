@@ -4132,7 +4132,11 @@ class PtzTab(QWidget):
             # 프레임 자세로 발밑을 지면 투영해 피치 밖을 거른다.
             if rc_pose is not None and self.check_infield.isChecked() and prow:
                 from ..core.rotcam import pixel_to_field
-                ok_rows = [pp for pp in prow if len(pp) >= 4]
+                # 수동 검출(tid>=900000)은 면제 — 사용자가 직접 추가한
+                # 사람을 자동 장외 필터가 숨기면 추적 확장 결과가 사라져
+                # 보인다 (경기장 밖 인물 추적 용례).
+                ok_rows = [pp for pp in prow if len(pp) >= 4
+                           and not (len(pp) >= 5 and pp[4] >= 900000)]
                 if ok_rows:
                     fxy = pixel_to_field(
                         rc_pose["K"], rc_pose["R"], rc_cam,
