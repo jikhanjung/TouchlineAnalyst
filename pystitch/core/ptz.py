@@ -1573,29 +1573,67 @@ def link_ball_tracks_cached(analysis_path, analysis, ball_conf=0.25,
     return linked
 
 
+def _ffmpeg_gray_strip(video_path, t, w, rows, timeout=30.0):
+    """빠른 시크(-ss)로 t초 프레임의 상단 rows행만 그레이스케일로 디코드.
+
+    cap.set(POS_FRAMES) 는 성긴 GOP 원본(파노라마 ~8초 GOP)에서 키프레임
+    부터 순차 디코드라 한 지점이 수 초 걸린다 — ffmpeg 는 -ss 를 입력
+    앞에 둬 키프레임으로 바로 점프. 파노라마는 카메라가 거의 안 움직여
+    상단 검은 경계가 프레임마다 같으니 -noaccurate_seek 로 정확한
+    타임스탬프까지 앞으로 디코드하지 않고 **키프레임만** 뽑는다(GOP만큼
+    앞 디코드 생략). 상단 스트립만 크롭(crop=iw:rows)해 전송·디코드량도
+    줄인다. 실패(시간초과·바이트 부족)면 None."""
+    import subprocess
+
+    from .encoders import ffmpeg_bin
+    cmd = [ffmpeg_bin(), "-v", "error", "-ss", f"{max(0.0, t):.6f}",
+           "-noaccurate_seek", "-i", str(video_path), "-frames:v", "1",
+           "-vf", f"crop=iw:{rows}:0:0", "-f", "rawvideo",
+           "-pix_fmt", "gray", "-"]
+    try:
+        p = subprocess.run(cmd, stdout=subprocess.PIPE,
+                           stderr=subprocess.DEVNULL, timeout=timeout)
+    except Exception:  # noqa: BLE001
+        return None
+    need = w * rows
+    if len(p.stdout) < need:
+        return None
+    return np.frombuffer(p.stdout[:need], np.uint8).reshape(rows, w)
+
+
 def measure_top_black(video_path, samples=5, dark=18, cover=0.90):
     """파노라마 상단 검은 스티칭 경계 높이 실측 (px).
 
     top_margin 의 근거는 이 경계뿐 — 고정 160px 대신 실측한다
     (--auto-el 산출물은 대개 0). 몇 프레임을 샘플해 행의 어두운 픽셀
     비율이 cover 이상인 최상단 연속 구간의 최대 높이 + 8px 여유.
+
+    시크는 ffmpeg 빠른 시크(-ss) — 성긴 GOP 원본에서 cap.set 순차
+    디코드가 지점당 수 초 걸리던 걸 회피 (실패 시 cv2 폴백).
     """
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
         return None
+    w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 1
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    rows = min(240, h) or 240
     worst = 0
     for k in range(samples):
-        cap.set(cv2.CAP_PROP_POS_FRAMES,
-                int(total * (k + 0.5) / samples))
-        ok, frame = cap.read()
-        if not ok:
-            continue
-        strip = cv2.cvtColor(frame[:240], cv2.COLOR_BGR2GRAY)
+        fno = int(total * (k + 0.5) / samples)
+        strip = (_ffmpeg_gray_strip(video_path, fno / max(fps, 1e-9), w, rows)
+                 if w > 0 else None)
+        if strip is None:                     # 빠른 시크 실패 → cv2 순차 폴백
+            cap.set(cv2.CAP_PROP_POS_FRAMES, fno)
+            ok, frame = cap.read()
+            if not ok:
+                continue
+            strip = cv2.cvtColor(frame[:rows], cv2.COLOR_BGR2GRAY)
         frac = (strip < dark).mean(axis=1)
-        h = 0
-        while h < len(frac) and frac[h] >= cover:
-            h += 1
-        worst = max(worst, h)
+        hh = 0
+        while hh < len(frac) and frac[hh] >= cover:
+            hh += 1
+        worst = max(worst, hh)
     cap.release()
     return worst + (8 if worst else 0)

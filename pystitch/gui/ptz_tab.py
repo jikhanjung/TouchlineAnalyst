@@ -3001,6 +3001,7 @@ class PtzTab(QWidget):
         self.field_lines = {}
         self.field_point_anchors = {}
         self.line_points = []
+        self._top_black = None                # 상단 검은 경계 캐시 (영상 고정값)
         self.extra_players = {}
         self.kit_colors = {}
         self.user_events = []
@@ -3042,6 +3043,8 @@ class PtzTab(QWidget):
                 k: [[float(p[0]), float(p[1]), int(p[2])] for p in pts]
                 for k, pts in (doc.get("field_point_anchors") or {}).items()}
             self.line_points = [list(p) for p in doc.get("line_points", [])]
+            _tb = doc.get("top_black")
+            self._top_black = int(_tb) if _tb is not None else None
             self.extra_players = {int(si): [list(p) for p in rows]
                                   for si, rows in
                                   (doc.get("extra_players") or {}).items()}
@@ -3147,6 +3150,8 @@ class PtzTab(QWidget):
                                    "field_lines": self.field_lines,
                                    "field_point_anchors":
                                        self.field_point_anchors,
+                                   "top_black": getattr(self, "_top_black",
+                                                        None),
                                    "field_size": self.field_size,
                                    "field_circle_r": self.field_circle_r,
                                    "field_circle_auto": self.field_circle_auto,
@@ -4729,8 +4734,14 @@ class PtzTab(QWidget):
             return
         ap = (self.pano_path.with_suffix(".analysis.json")
               if self.pano_path else None)
+        # 상단 검은 경계는 파노라마 고정값 — 사이드카에 캐시돼 있으면
+        # 재측정 생략(영상 시크 비용 회피). 없을 때만 워커에 video_path
+        # 를 넘겨 1회 측정하고 _link_done 이 캐시에 저장한다.
+        need_top = getattr(self, "_top_black", None) is None
+        if not need_top:
+            self.log(f"[plan] 상단 검은 경계 캐시: {self._top_black}px (측정 생략)")
         w = LinkWorker(self.analysis, analysis_path=ap,
-                       video_path=self.pano_path)
+                       video_path=(self.pano_path if need_top else None))
         w._analysis_id = id(self.analysis)    # 결과 도착 시 최신인지 확인
         w.done.connect(lambda linked, aid=id(self.analysis):
                        self._link_done(linked, aid))
@@ -4828,6 +4839,7 @@ class PtzTab(QWidget):
                 self._top_black = int(tb)
                 self.log(f"[plan] 상단 검은 경계 실측: {tb}px"
                          + ("" if tb else " — 상단 클램프 해제"))
+                self._save_keyframes()        # 캐시 — 다음 열기엔 측정 생략
             self._teams = linked.pop("teams", {}) or {}
             if self.roles and self.analysis is not None:
                 self._teams = classify_teams(self.analysis, roles=self.roles,
