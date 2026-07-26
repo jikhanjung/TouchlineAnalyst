@@ -4,76 +4,73 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## 프로젝트 개요
 
-PyStitch360는 전처리부터 최종 출력까지 전체 워크플로우를 자동화하는 포괄적인 360도 영상 스티칭 툴입니다. 듀얼 GoPro 영상을 자동 스티칭, 방향 조정, 인코딩을 통해 처리합니다.
+아마추어 축구 경기 영상 파이프라인. 듀얼 GoPro 를 파노라마로 스티칭하고
+(PitchStitch), 그 파노라마(또는 AX700 회전 캠 원본)에서 공/선수 검출·
+추적·팀 분류·가상 PTZ·하이라이트·리포트를 만든다 (PitchWatch).
 
-**핵심 파이프라인:** 입력 처리 → 스티칭 → 방향 조정 → 후처리 → 출력
+**파이프라인:** GoPro 챕터 체인 → 스티칭(equirect) → 검출/추적 분석 →
+편집·검수 GUI → PTZ/하이라이트 내보내기. `--headless` 로 전 단계 무인 실행.
 
-## 아키텍처
+## 진입점
 
-### 제안된 모듈 구조
-- `main.py`: 애플리케이션 진입점
-- `gui/`: PyQt6 기반 GUI 컴포넌트
-  - `stitcher_window.py`: 메인 애플리케이션 윈도우
-- `core/`: 핵심 처리 모듈
-  - `preprocessor.py`: 입력 처리 및 ffmpeg concat 작업
-  - `stitcher.py`: equirectangular 투영 기반 OpenCV 스티칭 엔진
-  - `postprocessor.py`: 인코딩 및 메타데이터 삽입
-- `presets/`: 카메라 캘리브레이션 데이터 (JSON/YAML)
-- `projects/`: 프로젝트 설정 파일
+- `main.py` — 통합 GUI. `--headless <L_dir> <R_dir>` 로 무인 파이프라인
+  (`pystitch/headless.py`: 스티칭→분석→호각→OCR→이벤트→프록시).
+- `pitchstitch.py` — 스티칭 전용 앱 (torch 미설치 환경에서도 기동).
+- `pitchwatch.py` — 경기 분석 앱 (PtzTab 승격, 파노라마/멀티캠 경기 열기).
 
-### 주요 기술 스택
-- **GUI 프레임워크**: PyQt6
-- **영상 처리**: ffmpeg-python, OpenCV
-- **스티칭**: equirectangular 투영 기반 OpenCV 스티칭 API
-- **인코딩**: H.264 (libx264) 기반 ffmpeg
-- **설정**: JSON 프로젝트 파일
+## 구조 (실제)
+
+- `pystitch/core/` — 수학·처리 코어 (GUI 무의존, 테스트 대상)
+  - 스티칭: `lens` `align` `geometry` `perspective` `export` `render`
+    `encoders` `chapters` `pairing` `sync` `sync_multi` `gpmf`
+  - 분석: `ptz`(검출/추적/크롭계획/레이더) `tracklets` `ocr` `audio`(호각)
+    `events` `highlights` `airborne` `metrics` `report`
+  - 경기장/카메라: `field`(랜드마크·파노라마 캘리브) `rotcam`(회전캠
+    자기캘리브: RANSAC PnP·프레임 간 이송·point-to-line) `match`(멀티캠)
+- `pystitch/gui/` — PyQt6. `ptz_tab.py`(분석 UI 본체, 대형), `main_window`,
+  `multicam`, `stats`, `widgets`, `workers`
+- `presets/` — 렌즈 프로파일, `venues.json`(경기장 규격), `tracker_pano.yaml`
+- `scripts/` — 실험/일회성 (rotcam_*, gapfill, referee, finetune_ball …)
+- `tests/` — pytest (합성 검증 위주), `devlog/` — 번호제 작업 로그,
+  `docs/heuristics.md` — 도메인 휴리스틱 카탈로그, `docs/ptz_workflow.md`
+
+## 사이드카 규약 (영상 옆 파일)
+
+`<video>.pystitch.json`(스티칭 프로젝트 — **존재 여부로 파노라마/rotcam
+판별**), `.ptz.json`(사용자 편집: 역할·병합·번호·랜드마크·확정앵커 —
+tid 로 연결), `.analysis.json`(검출 원본) + `.analysis.cache.json`(요약)
++ `.analysis.part.json`(체크포인트), `.ptz_hcache.npz`(rotcam 이송 H),
+`.scrub.mp4`(프록시), `.whistle.json`, `.events.json`, `.match.json`(멀티캠).
+
+**tid 네임스페이스:** ByteTrack 소형 정수 / 원경 타일 `_FarTracker`
+800001+ / 수동 검출(extra) 900001+. 전체 재분석은 tid 를 갈아치워
+`.ptz.json` 편집을 고아로 만든다 — 편집된 영상은 `--far-augment` 사용.
 
 ## 개발 명령어
 
-새 프로젝트이므로 표준 Python 개발 명령어를 사용합니다:
-
 ```bash
-# 의존성 설치 (requirements.txt 존재 시)
-pip install -r requirements.txt
+# WSL 개발/검증 환경 (torch 포함) — 시스템 python 엔 torch 없음
+source ~/venv/PyStitch360/bin/activate
+python -m pytest tests/ -q          # 전체 테스트 (수십 초)
+python -m py_compile <파일>         # 편집 후 최소 검증
 
-# 애플리케이션 실행
-python main.py
-
-# 테스트 실행 (테스트 프레임워크 설정 시)
-python -m pytest
-
-# 코드 포맷팅 (black 사용 시)
-black .
-
-# 코드 린팅 (flake8 사용 시)
-flake8 .
+# 무인 파이프라인 (실행은 보통 Windows PowerShell 의 PyStitch360 venv)
+python main.py --headless <L_dir> <R_dir> --auto-el
+#  --reanalyze(분석 처음부터, 편집 고아화 주의) --far-augment(원경만 추가)
 ```
 
-## 구현해야 할 주요 기능
+실제 GUI 실행·대용량 배치는 Windows(D:\projects\TouchlineAnalyst)에서,
+영상 원본은 F:\Pictures (WSL 에선 /mnt/f — 9p 라 대용량 I/O 느림).
 
-### 입력 처리
-- GoPro 파일 자동 인식 (`GOPR*.MP4`, `GP01*.MP4`)
-- demuxer 방식 ffmpeg concat
-- 프레임 오프셋을 통한 수동 동기화 조정 슬라이더
+## 작업 규약
 
-### 스티칭 엔진
-- 고정된 카메라 캘리브레이션 파라미터
-- Equirectangular 투영 워핑
-- 설정 가능한 블렌딩 옵션 (Linear blending, Feather width)
-
-### 방향 제어
-- PyQt6 기반 실시간 미리보기
-- 마우스 기반 Yaw/Pitch/Roll 조정
-- 워핑 파이프라인과 설정 통합
-
-### 출력 처리
-- 설정 가능한 CRF 및 프리셋으로 H.264 인코딩
-- Equirectangular 투영 메타데이터 삽입
-- Insta360 Studio 포맷 호환성
-
-### 프로젝트 관리
-- JSON 기반 설정 지속성
-- 다양한 영상에서 재사용 가능한 파라미터 세트
+- **작업 하나 끝나면 devlog 작성 + commit + push** (`devlog/YYYYMMDD_NNN_
+  slug.md`, NNN 은 최대+1. 최근 devlog 형식·톤 참고).
+- 수정 후 `py_compile` + pytest, 가능하면 실데이터(/mnt/f 사이드카)로
+  검증. 합성 검증은 tests/ 에 남긴다.
+- 무거운 계산은 "한 번 계산하면 캐시" 원칙 (top_black, H 캐시, 요약
+  캐시 등 선례). 느린 단계는 로그(타임스탬프)로 보이게.
+- GUI 스레드에서 수 초 이상 걸리는 작업은 QThread 워커 + 진행 로그.
 
 ## 도메인 휴리스틱
 
@@ -81,17 +78,3 @@ flake8 .
 속도 상한 등)은 **docs/heuristics.md** 에 카탈로그로 관리한다. 새 휴리스틱
 추가·파라미터 변경·폐기 시 반드시 그 문서에 등록하고, 가능하면 tests/ 에
 합성 테스트를 함께 둔다.
-
-## 중요한 구현 참고사항
-
-- 워핑 및 블렌딩을 위해 OpenCV의 상세 스티칭 API 사용
-- OpenCV (`cv2.imshow`) 또는 OpenGL을 사용한 실시간 미리보기 구현
-- 카메라 캘리브레이션 데이터를 JSON/YAML 형식으로 저장
-- 360도 영상 플레이어와의 메타데이터 호환성 보장
-- 향후 확장을 위한 모듈형 아키텍처 설계 (optical flow, 멀티카메라 지원)
-
-## 향후 확장 기능
-- Optical Flow 기반 적응형 심 감지
-- AI 기반 안정화
-- 멀티카메라 (2개 이상) 지원
-- 오디오 기반 자동 동기화
