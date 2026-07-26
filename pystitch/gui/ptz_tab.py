@@ -2005,15 +2005,21 @@ class PtzTab(QWidget):
     def _hide_radar(self):
         self._radar_lbl.hide()
 
+    # 스크럽마다 반복되는 상세 로그는 상태줄에서 제외 (로그 탭엔 그대로)
+    _STATUS_SKIP = ("원본 승격", "폐기")
+
     def log(self, msg):
         """메인 윈도우 로그 + 탭 내 로그 미러. 각 줄 앞에 현재 시각(ms)
-        — 단계 사이 지연을 눈으로 재기 위함."""
+        — 단계 사이 지연을 눈으로 재기 위함. 하단 상태줄에도 요약 표시."""
         from datetime import datetime
         msg = f"[{datetime.now().strftime('%H:%M:%S.%f')[:-3]}] {msg}"
         self._ext_log(msg)
         lv = getattr(self, "log_view", None)
         if lv is not None:
             lv.appendPlainText(str(msg))
+        lb = getattr(self, "lbl_statusline", None)
+        if lb is not None and not any(s in msg for s in self._STATUS_SKIP):
+            lb.setText(msg)
 
     def eventFilter(self, obj, ev):
         """커서가 타임라인/슬라이더/영상 위일 때 Space = 재생/정지.
@@ -2476,6 +2482,17 @@ class PtzTab(QWidget):
         v.addLayout(bottom)
         self.progress = QProgressBar()
         v.addWidget(self.progress)
+        # 맨 아래 상태줄 — 마지막 로그(요약)로 현재 작업을 보여준다.
+        # 로그 탭을 안 열어도 뭘 하는 중인지 보이게 (사용자 방향).
+        from PyQt6.QtWidgets import QSizePolicy
+        self.lbl_statusline = QLabel("")
+        self.lbl_statusline.setStyleSheet(
+            "QLabel { color: #9fb8c8; background: #161616;"
+            " padding: 2px 8px; font-size: 11px; }")
+        self.lbl_statusline.setSizePolicy(QSizePolicy.Policy.Ignored,
+                                          QSizePolicy.Policy.Fixed)
+        self.lbl_statusline.setMinimumWidth(1)   # 긴 로그가 창을 늘리지 않게
+        v.addWidget(self.lbl_statusline)
 
     # ------------------------------------------------------------ 파일/분석
     def _open_pano(self):

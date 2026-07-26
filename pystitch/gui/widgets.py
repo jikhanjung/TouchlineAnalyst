@@ -43,7 +43,8 @@ class FramePane(QLabel):
         self._vc = [0.5, 0.5]             # 보이는 영역 중심 (전체 프레임 비율)
         self._grid = False
         if interactive:
-            self.setCursor(Qt.CursorShape.OpenHandCursor)
+            # 평상시엔 일반 화살표 (사용자 방향) — 드래그/팬 중에만 손
+            self.setCursor(Qt.CursorShape.ArrowCursor)
             self.setMouseTracking(True)   # 버튼 없이도 hover 위치 추적
 
     # ------------------------------------------------------------ 줌/팬
@@ -203,9 +204,7 @@ class FramePane(QLabel):
     def mouseReleaseEvent(self, ev):
         if self._pan_pos is not None:
             self._pan_pos = None
-            self.setCursor(Qt.CursorShape.OpenHandCursor
-                           if self._interactive
-                           else Qt.CursorShape.ArrowCursor)
+            self.setCursor(Qt.CursorShape.ArrowCursor)
             return
         if self._drag_pos is not None:
             fr = self._frac_clamped(ev.position())
@@ -216,7 +215,7 @@ class FramePane(QLabel):
                 if fr is not None:
                     self.clicked.emit(fr[0], fr[1])
             self._drag_pos = None
-            self.setCursor(Qt.CursorShape.OpenHandCursor)
+            self.setCursor(Qt.CursorShape.ArrowCursor)
         super().mouseReleaseEvent(ev)
 
     def set_frame(self, bgr: np.ndarray | None):
