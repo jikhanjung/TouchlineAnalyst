@@ -5876,11 +5876,12 @@ class PtzTab(QWidget):
             f"선수 {len(r['rows'])}명 (players.md 요약표 포함)")
 
     def run_jersey_ocr(self):
-        """분석 메뉴: 등번호 OCR — 근측(큰 박스) 선수 (devlog 040).
+        """분석 메뉴: 등번호 OCR (devlog 040).
 
-        rotcam(AX700 등)은 파노라마 필드 캘리브(_field_calib)가 없다 —
-        calib=None 으로 넘기면 collect_ocr_candidates 가 필드 근/원 게이트
-        대신 박스 높이 게이트만 쓴다(원경 선수는 작아서 대부분 걸러짐)."""
+        파노라마: 근측 절반(필드 Y<0)의 큰 박스만 — 원경은 수십 px 라
+        인식 불가. rotcam(AX700 등): 팬/줌 카메라라 프레임에 잡힌 선수가
+        대체로 크다 — **근측 구분 없이 전체 검출 선수** (사용자 방향
+        2026-07-26), 박스 높이 게이트만 (calib=None 경로)."""
         if self.analysis is None or self.pano_path is None:
             QMessageBox.information(self, "등번호 OCR", "먼저 분석이 필요합니다.")
             return
@@ -5903,16 +5904,17 @@ class PtzTab(QWidget):
                    if self._outfield else self._role_of)
         picked = collect_ocr_candidates(self.analysis, calib,
                                         role_of, self._rep)
+        scope = "전체 선수" if rotcam else "근측"
         if not picked:
             gate = ("박스 높이 ≥90px" if calib is None
                     else "필드 Y<0, 박스 높이 ≥90px")
             QMessageBox.information(
-                self, "등번호 OCR", f"근측 후보가 없습니다 ({gate}).")
+                self, "등번호 OCR", f"{scope} 후보가 없습니다 ({gate}).")
             return
         n_rep = len({r for _, _, r in picked})
         if QMessageBox.question(
                 self, "등번호 OCR",
-                f"근측 트랙릿 {n_rep}개, 크롭 {len(picked)}장을 인식합니다 "
+                f"{scope} 트랙릿 {n_rep}개, 크롭 {len(picked)}장을 인식합니다 "
                 f"(easyocr, 수 분 예상). 진행할까요?") \
                 != QMessageBox.StandardButton.Yes:
             return
@@ -5924,7 +5926,7 @@ class PtzTab(QWidget):
         w.done.connect(self._ocr_done)
         w.failed.connect(lambda m: self.log(f"[ocr] 실패: {m}"))
         self._ocr_worker = w
-        self.log(f"[ocr] 시작: 근측 트랙릿 {n_rep}개, 크롭 {len(picked)}장")
+        self.log(f"[ocr] 시작: {scope} 트랙릿 {n_rep}개, 크롭 {len(picked)}장")
         w.start()
 
     def _ocr_done(self, out):

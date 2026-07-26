@@ -59,7 +59,7 @@ class PitchWatchWindow(QMainWindow):
                     lambda: self.ptz.detect_events())
         a.addAction("트랙릿 병합 제안 (ReID 라이트)",
                     lambda: self.ptz.suggest_tracklet_merges())
-        a.addAction("등번호 OCR (근측 선수)...",
+        a.addAction("등번호 OCR (파노라마는 근측만)...",
                     lambda: self.ptz.run_jersey_ocr())
         a.addSeparator()
         a.addAction("하이라이트 후보 생성 (이벤트 융합)",
