@@ -1,0 +1,21 @@
+# 파노라마(정적 카메라) 경기 분석용 BoT-SORT 튜닝 — devlog 078
+#
+# 기본값 대비 바꾼 것:
+# - gmc_method none: 카메라가 고정(파노라마/삼각대)이라 전역 움직임 보상
+#   (sparseOptFlow)은 비용만 들고 대형 프레임에서 느리다.
+# - track_buffer 60: detect_every=3 이면 트래커 체감 10fps — 기본 30(=3초)
+#   은 가림/미검출에 짧다. 60(=6초)으로 재획득 창 확대 (트랙릿 파편 감소).
+# - with_reid true + model auto: 검출기 특징 기반 외형 ReID — 교차/재진입
+#   시 ID 스왑 감소. (0.1 저문턱과 함께 ByteTrack 2단 연결도 활용됨)
+tracker_type: botsort
+track_high_thresh: 0.25
+track_low_thresh: 0.1
+new_track_thresh: 0.25
+track_buffer: 60
+match_thresh: 0.8
+fuse_score: True
+gmc_method: none
+proximity_thresh: 0.5
+appearance_thresh: 0.8
+with_reid: True
+model: auto

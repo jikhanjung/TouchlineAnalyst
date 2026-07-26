@@ -145,9 +145,50 @@ def detect_raw(model, frame, det_w=2944, conf=0.2):
     return np.array(out) if out else np.zeros((0, 6))
 
 
+class _FarTracker:
+    """원경 타일 검출용 미니 트래커 — 최근접 연결.
+
+    ByteTrack 은 메인 패스(model.track) 내부에 묶여 있어 타일 검출을
+    받을 수 없다. 원경 선수는 샘플 간 이동이 작아(0.1s 에 ~10px)
+    최근접 연결로 충분 — 타일 검출에 안정적 tid(800001+, ByteTrack
+    소형 정수·수동 900000+ 와 분리)를 붙여 **트랙릿/팀분류에 참여**
+    시킨다 (사용자 방향). conf 내림차순 그리디, max_miss 샘플 놓치면
+    트랙 종료."""
+
+    def __init__(self, radius, max_miss):
+        self.tracks: dict[int, tuple] = {}   # tid → (x, y, 마지막 샘플)
+        self.next_id = 800001
+        self.r2 = float(radius) ** 2
+        self.max_miss = max_miss
+
+    def update(self, dets, si):
+        """dets: [[x, y, conf, w, h], ...] (conf 내림차순) → [tid, ...]"""
+        # 만료 트랙은 매칭 **전에** 정리 — 뒤에 하면 오래 사라진 트랙이
+        # 같은 자리 새 사람에게 재사용된다 (테스트가 잡은 버그)
+        for t in [t for t, (_x, _y, last) in self.tracks.items()
+                  if si - last > self.max_miss]:
+            del self.tracks[t]
+        out, used = [], set()
+        for d in dets:
+            best, bd = None, self.r2
+            for t, (x, y, _last) in self.tracks.items():
+                if t in used:
+                    continue
+                dd = (d[0] - x) ** 2 + (d[1] - y) ** 2
+                if dd < bd:
+                    best, bd = t, dd
+            if best is None:
+                best = self.next_id
+                self.next_id += 1
+            used.add(best)
+            self.tracks[best] = (d[0], d[1], si)
+            out.append(best)
+        return out
+
+
 def analyze_video(path, detect_every=3, det_w=None, field_top_frac=0.26,
                   weights=None, far_boost=True, far_band_frac=0.58,
-                  conf_near=0.2, conf_far=0.1,
+                  conf_near=0.2, conf_far=0.1, tracker_cfg=None,
                   cancel=None, progress=None, checkpoint_path=None,
                   checkpoint_every=1500, crop_hook=None, log=print):
     """1패스: 프레임 샘플마다 공/선수 검출. 반환 dict 는 JSON 직렬화 가능.
@@ -175,6 +216,13 @@ def analyze_video(path, detect_every=3, det_w=None, field_top_frac=0.26,
     from ultralytics import YOLO
     model = YOLO(str(weights or _DEFAULT_WEIGHTS))
     model_far = YOLO(str(weights or _DEFAULT_WEIGHTS)) if far_boost else None
+    # 트래커 설정: 정적 카메라 튜닝(presets/tracker_pano.yaml — gmc 끔,
+    # buffer 60, ReID 켬)이 있으면 기본 botsort 대신 사용
+    if tracker_cfg is None:
+        cand = Path(__file__).resolve().parents[2] / "presets" \
+            / "tracker_pano.yaml"
+        tracker_cfg = str(cand) if cand.exists() else "botsort.yaml"
+    log(f"[analyze] 트래커: {Path(str(tracker_cfg)).name}")
     cap = cv2.VideoCapture(str(path))
     if not cap.isOpened():
         raise RuntimeError(f"열 수 없음: {path}")
@@ -185,6 +233,10 @@ def analyze_video(path, detect_every=3, det_w=None, field_top_frac=0.26,
     if det_w is None:
         det_w = min(round(pano_w / 2 / 32) * 32, 4416)
     field_top = field_top_frac * pano_h
+    # 원경 타일 검출용 미니 트래커 — 연결 반경은 파노라마 폭 비례
+    # (~0.8%: 6540px→52px), 2초 놓치면 트랙 종료
+    far_tracker = _FarTracker(radius=pano_w * 0.008,
+                              max_miss=2.0 * fps / detect_every)
     frames_idx, balls, players = [], [], []
     ball_cands = []
     import time
@@ -193,7 +245,8 @@ def analyze_video(path, detect_every=3, det_w=None, field_top_frac=0.26,
     ckpt_key = {"video": str(path), "detect_every": detect_every, "det_w": det_w,
                 "weights": str(weights or _DEFAULT_WEIGHTS),
                 "far_boost": bool(far_boost),
-                "conf_near": conf_near, "conf_far": conf_far}
+                "conf_near": conf_near, "conf_far": conf_far,
+                "tracker": Path(str(tracker_cfg)).name}
     if checkpoint_path is not None and Path(checkpoint_path).exists():
         try:
             ck = _json.loads(Path(checkpoint_path).read_text())
@@ -236,6 +289,7 @@ def analyze_video(path, detect_every=3, det_w=None, field_top_frac=0.26,
                                interpolation=cv2.INTER_AREA)
             r = model.track(small, imgsz=det_w, conf=min(conf_near, conf_far),
                             classes=[_CLS_PERSON, _CLS_BALL],
+                            tracker=tracker_cfg,
                             persist=True, verbose=False)[0]
             far_balls, far_persons = [], []
             if model_far is not None:
@@ -295,13 +349,15 @@ def analyze_video(path, detect_every=3, det_w=None, field_top_frac=0.26,
                              round((x2 - x1) / scale, 1), round((y2 - y1) / scale, 1),
                              tid, round(hm, 1), round(sm, 1), round(vm, 1)])
             # 원경 네이티브 '사람' 병합 — 절반 해상도 메인 패스가 놓친
-            # 원경 선수 보완 (tid=-1: 추적기 밖). 기존 박스와 근접하면
-            # 중복 제거, conf 순으로 넣어 타일 겹침 중복도 자체 정리.
+            # 원경 선수 보완. 기존 박스와 근접하면 중복 제거, conf 순으로
+            # 넣어 타일 겹침 중복도 자체 정리. 미니 트래커(_FarTracker)로
+            # tid 를 붙여 트랙릿/팀분류에 참여 (사용자 방향).
             far_persons.sort(key=lambda p: -p[2])
-            for fx, fy, fc, fw_, fh_ in far_persons:
-                if any((fx - p[0]) ** 2 + (fy - p[1]) ** 2
-                       < max(fw_, 25.0) ** 2 for p in prow):
-                    continue
+            fresh = [fp for fp in far_persons
+                     if not any((fp[0] - p[0]) ** 2 + (fp[1] - p[1]) ** 2
+                                < max(fp[3], 25.0) ** 2 for p in prow)]
+            ftids = far_tracker.update(fresh, len(frames_idx))
+            for (fx, fy, fc, fw_, fh_), ftid in zip(fresh, ftids):
                 ty1, ty2 = int(fy - fh_ / 2), int(fy)
                 tx1, tx2 = int(fx - fw_ * 0.3), int(fx + fw_ * 0.3)
                 torso = frame[max(ty1, 0):max(ty2, 1), max(tx1, 0):max(tx2, 1)]
@@ -311,7 +367,7 @@ def analyze_video(path, detect_every=3, det_w=None, field_top_frac=0.26,
                 else:
                     hm = sm = vm = 0.0
                 prow.append([round(fx, 1), round(fy, 1), round(fw_, 1),
-                             round(fh_, 1), -1,
+                             round(fh_, 1), int(ftid),
                              round(hm, 1), round(sm, 1), round(vm, 1)])
             # 원경 네이티브 검출 병합 → 근접 중복 제거 후 상위 3개 저장.
             # 후보 다수 보존: 미끼가 conf 를 이겨도 진짜 공이 살아남아
