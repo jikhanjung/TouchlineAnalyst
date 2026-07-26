@@ -4085,6 +4085,7 @@ class PtzTab(QWidget):
             # rotcam: 현재 프레임 자세 — 장외 필터·레이더 지면 투영 공용.
             # 자세를 못 푼 프레임은 둘 다 생략 (엉뚱한 근사보다 안전).
             rc_pose = rc_cam = None
+            rc_dropped = []               # 이 프레임 장외 판정 행 (회색 표시)
             if (getattr(self, "_is_rotcam", False)
                     and getattr(self, "_rc_calib", None) is not None
                     and (self.check_infield.isChecked()
@@ -4109,6 +4110,7 @@ class PtzTab(QWidget):
                         drop = {id(pp) for pp, (gx, gy) in zip(ok_rows, fxy)
                                 if not (np.isfinite(gx) and abs(gx) <= hl
                                         and abs(gy) <= hw)}
+                        rc_dropped = [pp for pp in prow if id(pp) in drop]
                         prow = [pp for pp in prow if id(pp) not in drop]
             sel = self.trackbar.selected
             sel_rep = (self._rep(sel[1]) if sel and sel[0] == "player"
@@ -4156,25 +4158,29 @@ class PtzTab(QWidget):
                                     max(1, int(3 * sc)))
                 # 무시(숨긴) 사람도 회색 점선 박스로 — 누구를 숨겼는지 보이고
                 # 우클릭 복원 가능 (_players_row 는 제외하므로 raw 에서 별도로)
-                if self.hidden_players:
+                # 수동 숨김·자동 장외 모두 동일하게 회색 박스+X (사용자
+                # 방향: 구분 불필요 — 누가 걸러졌는지만 보이면 된다).
+                # 수동은 우클릭 복원, 장외는 '장외 숨김' 체크 해제.
+                excl = self._person_excluded()
+                gray_rows = list(rc_dropped)   # rotcam 프레임 장외
+                if excl:                       # 수동 숨김 + 파노라마 장외
                     raw = (list(self.analysis["players"][si])
                            + self.extra_players.get(int(si), []))
-                    for pp in raw:
-                        if len(pp) < 5 or pp[4] < 0:
-                            continue
-                        if self._rep(int(pp[4])) not in self.hidden_players:
-                            continue
-                        x1 = int((pp[0] - pp[2] / 2) * sc)
-                        y1 = int((pp[1] - pp[3] / 2) * sc)
-                        x2 = int((pp[0] + pp[2] / 2) * sc)
-                        y2 = int((pp[1] + pp[3] / 2) * sc)
-                        gc = (110, 110, 110)
-                        cv2.rectangle(frame, (x1, y1), (x2, y2), gc,
-                                      max(1, int(1 * sc)))
-                        cv2.putText(frame, "X",
-                                    (x1, y1 - max(3, int(6 * sc))),
-                                    cv2.FONT_HERSHEY_SIMPLEX,
-                                    max(0.4, 0.8 * sc), gc, max(1, int(2 * sc)))
+                    gray_rows += [pp for pp in raw
+                                  if len(pp) >= 5 and pp[4] >= 0
+                                  and self._rep(int(pp[4])) in excl]
+                for pp in gray_rows:
+                    x1 = int((pp[0] - pp[2] / 2) * sc)
+                    y1 = int((pp[1] - pp[3] / 2) * sc)
+                    x2 = int((pp[0] + pp[2] / 2) * sc)
+                    y2 = int((pp[1] + pp[3] / 2) * sc)
+                    gc = (110, 110, 110)
+                    cv2.rectangle(frame, (x1, y1), (x2, y2), gc,
+                                  max(1, int(1 * sc)))
+                    cv2.putText(frame, "X",
+                                (x1, y1 - max(3, int(6 * sc))),
+                                cv2.FONT_HERSHEY_SIMPLEX,
+                                max(0.4, 0.8 * sc), gc, max(1, int(2 * sc)))
             ball_g = None
             # 레이더 공 = 수락 트랙 기준 — 원시 검출을 쓰면 무시한
             # 오인식 공이 미니맵에 계속 공으로 남는다
