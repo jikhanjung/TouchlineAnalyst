@@ -127,6 +127,20 @@ def export_pano(lens, segments, left_files, right_files, offset_sec,
             tf.write(f"file '{Path(f).as_posix()}'\n")
         concat_list = tf.name
 
+    # NVENC 해상도 한계 재판정 — h264 NVENC 는 4096px 폭까지라 5~6K
+    # 파노라마는 'No capable devices found' 로 죽는다 (5312px 실측).
+    # hevc NVENC(8192px)로 강등, 그것도 안 되면 libx264.
+    from .encoders import (H264_NVENC_MAX_W, HEVC_NVENC_MAX_W, nvenc_works)
+    if codec == "h264_nvenc" and out_w > H264_NVENC_MAX_W:
+        codec = ("hevc_nvenc" if out_w <= HEVC_NVENC_MAX_W
+                 and nvenc_works("hevc_nvenc") else "libx264")
+        log(f"[encode] 폭 {out_w}px > h264 NVENC 한계 {H264_NVENC_MAX_W}"
+            f" → {codec}")
+    elif codec == "hevc_nvenc" and out_w > HEVC_NVENC_MAX_W:
+        codec = "libx264"
+        log(f"[encode] 폭 {out_w}px > hevc NVENC 한계 {HEVC_NVENC_MAX_W}"
+            f" → libx264")
+
     duration = total / fps
     # 키프레임 간격(GOP): 기본 250(≈8초)이면 큰 원본 프레임 시크가 느리다
     # (키프레임부터 순차 디코드). gop_sec(기본 2초)로 촘촘히 넣어 원본

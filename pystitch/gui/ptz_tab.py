@@ -1210,9 +1210,10 @@ class ProxyWorker(QThread):
     def run(self):
         import subprocess
 
-        from ..core.encoders import available_encoders, ffmpeg_bin
+        from ..core.encoders import available_encoders, ffmpeg_bin, \
+            nvenc_works
         encs = available_encoders().values()
-        if "h264_nvenc" in encs:
+        if "h264_nvenc" in encs and nvenc_works():
             venc = ["-c:v", "h264_nvenc", "-preset", "p1", "-rc", "vbr",
                     "-cq", "27", "-b:v", "0"]
         else:

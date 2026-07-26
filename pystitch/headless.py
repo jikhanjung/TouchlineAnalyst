@@ -393,7 +393,11 @@ def _make_scrub_proxy(pano: Path):
     from .core.encoders import available_encoders, ffmpeg_bin
     # 예전엔 잘못된 키("NVENC (H.264)")로 조회해 NVENC 가 있어도 항상
     # libx264 로 폴백했다 — 실제 인코더 이름(h264_nvenc)으로 판정.
-    has_nvenc = any(e == "h264_nvenc" for e in available_encoders().values())
+    # nvenc_works(): WSL 은 목록에 있어도 디바이스가 없어 런타임 판정 필수.
+    from .core.encoders import nvenc_works
+    has_nvenc = (any(e == "h264_nvenc"
+                     for e in available_encoders().values())
+                 and nvenc_works())
     venc = (["-c:v", "h264_nvenc", "-cq", "26"] if has_nvenc
             else ["-c:v", "libx264", "-preset", "veryfast", "-crf", "24"])
     cmd = [ffmpeg_bin(), "-y", "-v", "error", "-i", str(pano),
@@ -559,6 +563,13 @@ def process_pair(pair, out_dir: Path, lens, lens_name, args) -> Path:
          f"↔ R {right_chain[0].name} 외 {len(right_chain)-1}개 "
          f"(크기차 {cost:.1%})")
     tm = _StageTimer(pano)
+    # 최소 크기 가드: 실패한 인코드가 남긴 0바이트/파편 파일을 '있음'
+    # 으로 보고 건너뛰면 분석이 moov 없음으로 죽는다 (실측 2회) —
+    # 1MB 미만이면 깨진 잔재로 보고 재스티칭.
+    if pano.exists() and pano.stat().st_size < (1 << 20):
+        _log(f"[stitch] {pano.name} 이 {pano.stat().st_size}B — 깨진 잔재 "
+             "삭제 후 재스티칭")
+        pano.unlink()
     if pano.exists() and not args.force:
         _log(f"[stitch] {pano.name} 있음 — 건너뜀")
     else:
