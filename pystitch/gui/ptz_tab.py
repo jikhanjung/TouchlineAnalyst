@@ -2860,7 +2860,11 @@ class PtzTab(QWidget):
             # 모델을 쓴다 (P06-3 GUI 통합).
             self._is_rotcam = not self.pano_path.with_suffix(
                 ".pystitch.json").exists()
-            self._Hcache = {}                 # (src,dst) → 이송 호모그래피
+            # H 캐시: 영상이 불변이라 (src,dst)→H 는 세션 간에도 유효 —
+            # 디스크 캐시를 로드해 재열기 시 디코드+SIFT (수 초×프레임쌍,
+            # C0011 실측 17s) 를 건너뛴다.
+            self._Hcache = self._load_hcache() if self._is_rotcam else {}
+            self._hcache_n = len(self._Hcache)  # 저장 시 신규 항목 판정
             self._graycache = {}              # frame → det_w 그레이
             self._lm_transferred = {}         # 현재 프레임 이송 랜드마크
             self._remember_dir(str(self.pano_path.parent))
@@ -7033,6 +7037,7 @@ class PtzTab(QWidget):
             cal["ref_frame"] = ref
             self._rc_calib = cal
             self._rc_skip = skipped
+        self._save_hcache()               # 리핏 중 계산된 H 도 디스크에
 
     def _field_status(self):
         pass
@@ -7158,6 +7163,45 @@ class PtzTab(QWidget):
         return 1.8 / max(d, 1.0) / span * (self.pano_h - 1)
 
     _RC_DETW = 1600
+
+    # ---------------- 이송 H 디스크 캐시 (영상 불변 → 세션 간 재사용)
+    def _hcache_path(self) -> Path:
+        return self.pano_path.with_suffix(".ptz_hcache.npz")
+
+    def _load_hcache(self) -> dict:
+        """(src,dst)→H 디스크 캐시 로드. 실패쌍(None)도 복원해 재시도
+        비용(원본 디코드+SIFT)을 막는다. 매칭 해상도가 바뀌면 무효."""
+        try:
+            p = self._hcache_path()
+            if not p.exists():
+                return {}
+            d = np.load(p)
+            if "detw" not in d.files or int(d["detw"]) != self._RC_DETW:
+                return {}
+            out = {}
+            for (a, b), m in zip(d["pairs"], d["mats"]):
+                out[(int(a), int(b))] = None if np.isnan(m).any() else m
+            self.log(f"[rc] 이송 H 캐시 로드: {len(out)}쌍 (SIFT 생략)")
+            return out
+        except Exception as e:  # noqa: BLE001
+            self.log(f"[rc] H 캐시 무시: {e}")
+            return {}
+
+    def _save_hcache(self):
+        """새로 계산된 H 가 있으면 디스크에 저장 (수 KB, 호출 비용 미미)."""
+        if (not getattr(self, "_is_rotcam", False) or self.pano_path is None
+                or len(self._Hcache) == getattr(self, "_hcache_n", -1)):
+            return
+        try:
+            pairs = np.array(list(self._Hcache.keys()), int).reshape(-1, 2)
+            mats = (np.stack([np.full((3, 3), np.nan) if v is None else v
+                              for v in self._Hcache.values()])
+                    if len(pairs) else np.zeros((0, 3, 3)))
+            np.savez_compressed(self._hcache_path(), pairs=pairs, mats=mats,
+                                detw=self._RC_DETW)
+            self._hcache_n = len(self._Hcache)
+        except Exception as e:  # noqa: BLE001
+            self.log(f"[rc] H 캐시 저장 실패: {e}")
 
     def _rc_gray(self, f):
         """프레임 f 의 det_w 그레이 (캐시) — 호모그래피 매칭용."""
@@ -7397,12 +7441,19 @@ class PtzTab(QWidget):
         self._lm_transferred = {}
         if not getattr(self, "_is_rotcam", False):
             return
+        t0 = time.perf_counter()
         cur = int(getattr(self, "_cur_frame_idx", self.slider.value()))
         for k in self.field_points:
             got = self._rc_anchor_for(k, cur)
             if got is not None:
                 (x, y), _src = got
                 self._lm_transferred[k] = (x, y)
+        self._save_hcache()               # 새 H → 디스크 (재열기·재방문 가속)
+        dt = time.perf_counter() - t0
+        if dt >= 0.5:                     # 캐시 미스로 디코드+SIFT 한 경우만
+            self.log(f"[rc] 랜드마크 이송 {len(self._lm_transferred)}"
+                     f"/{len(self.field_points)}개 — {dt:.1f}s "
+                     "(신규 프레임쌍 SIFT, 결과는 캐시됨)")
 
     def _rc_confirm_frame(self):
         """현재 프레임의 이송 랜드마크를 확정 앵커로 일괄 승격.
