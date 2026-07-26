@@ -26,7 +26,7 @@ def make_K(f, w, h):
                      [0.0, 0.0, 1.0]])
 
 
-def _fscan_pnp(obj, img, w, h, f_frac, steps):
+def _fscan_pnp(obj, img, w, h, f_frac, steps, golden=40):
     """f 1D 탐색 + 평면 PnP(IPPE) → {f,K,R,t,cam_pos,rms_px,rvec,tvec}
     또는 None. 필드 점은 모두 z=0 평면 → IPPE(평면 전용, 4점부터).
     ITERATIVE 는 OpenCV 5.0 에서 4점 평면을 DLT 로 처리하려다 예외를
@@ -65,7 +65,7 @@ def _fscan_pnp(obj, img, w, h, f_frac, steps):
     hi = fs[min(i + 1, len(fs) - 1)]
     g = (np.sqrt(5) - 1) / 2                     # 황금분할
     a, b = lo, hi
-    for _ in range(40):
+    for _ in range(golden):
         c, d = b - g * (b - a), a + g * (b - a)
         if solve(c)[0] < solve(d)[0]:
             b = d
@@ -84,7 +84,7 @@ def _fscan_pnp(obj, img, w, h, f_frac, steps):
 
 
 def calibrate_reference(px_pts, field_pts, img_size, f_frac=(0.4, 3.0),
-                        steps=40, reject_px=40.0, min_keep=6):
+                        steps=40, reject_px=40.0, min_keep=6, f_hint=None):
     """기준 프레임 랜드마크 → {f, K, R, t, cam_pos, rms_px}.
 
     px_pts: 이미지 픽셀 [(u, v)], field_pts: 필드 [(X, Y)] (z=0),
@@ -104,6 +104,12 @@ def calibrate_reference(px_pts, field_pts, img_size, f_frac=(0.4, 3.0),
     n = len(obj)
     if n < 4:
         return None
+    golden = 40
+    if f_hint is not None and f_hint > 0:
+        # 라이브 미세조정(랜드마크 드래그): 직전 f ±15% 만 좁게 탐색 —
+        # 전 범위 재피팅(~140ms)을 수십 ms 로. 전 범위는 놓을 때.
+        f_frac = (0.85 * f_hint / w, 1.15 * f_hint / w)
+        steps, golden = 7, 12
     # 1) 이상치 배제 — f 거친 스캔 × RANSAC, (inlier 수, -rms) 최대 선택
     best = None
     for f in np.linspace(f_frac[0] * w, f_frac[1] * w, steps):
@@ -126,7 +132,7 @@ def calibrate_reference(px_pts, field_pts, img_size, f_frac=(0.4, 3.0),
     keep = best[1] if (best is not None and len(best[1]) >= 4) \
         else np.arange(n)                       # RANSAC 실패 시 전점 폴백
     # 2) inlier(정상점)로 정밀 f·자세 — 이 집합은 깨끗하니 비강건 IPPE
-    sol = _fscan_pnp(obj[keep], img[keep], w, h, f_frac, steps)
+    sol = _fscan_pnp(obj[keep], img[keep], w, h, f_frac, steps, golden)
     if sol is None:
         return None
     return {"f": sol["f"], "K": sol["K"], "R": sol["R"], "t": sol["t"],
@@ -136,7 +142,8 @@ def calibrate_reference(px_pts, field_pts, img_size, f_frac=(0.4, 3.0),
 
 
 def calibrate_reference_lines(px_pts, field_pts, line_px, line_fam, img_size,
-                              length=105.0, width=68.0, min_points=6):
+                              length=105.0, width=68.0, min_points=6,
+                              f_hint=None):
     """점 랜드마크(완전 X,Y) + 라인 점(터치라인 등)을 함께 쓴 캘리브.
 
     점만으론 시야가 좁을 때 초점거리 f 가 준퇴화(팬 퇴화)한다. 평행한
@@ -152,7 +159,7 @@ def calibrate_reference_lines(px_pts, field_pts, line_px, line_fam, img_size,
 
     라인 점이 없으면 (1) 결과 그대로. line_fam: 각 라인 점의 패밀리
     (_marking_lines 인덱스; 가까운 터치라인=0, 먼=1, 골라인=2/3 …)."""
-    base = calibrate_reference(px_pts, field_pts, img_size)
+    base = calibrate_reference(px_pts, field_pts, img_size, f_hint=f_hint)
     if base is None:
         return None
     # 점이 충분하면 라인 무시 (폴백 정책)

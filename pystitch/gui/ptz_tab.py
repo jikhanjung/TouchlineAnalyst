@@ -3797,9 +3797,18 @@ class PtzTab(QWidget):
             ny = round(fy * self.pano_h, 1)
             self.field_points[self._lm_drag] = [nx, ny]
             self.field_point_frames[self._lm_drag] = int(self.slider.value())
-            # 라이브 마커만 이동 — 무거운 재피팅은 놓을 때(_pane_released).
-            # 매 픽셀 재캘리브레이션은 미세조정을 렉걸리게 했다.
             self._lm_transferred[self._lm_drag] = (nx, ny)
+            # 파노라마 재피팅(TPS 워프)은 무거워 놓을 때만 — 매 픽셀
+            # 재캘리브는 미세조정을 렉걸리게 했다. rotcam 은 H 캐시로
+            # 재피팅이 ~수십 ms — 150ms 스로틀로 드래그 중에도 경기장
+            # 라인을 라이브 갱신 (사용자 요청). 드래그 중 어정쩡한 위치는
+            # RANSAC 이 이상치로 걸러 라인이 널뛰지 않는다.
+            if getattr(self, "_is_rotcam", False):
+                now = time.perf_counter()
+                if now - getattr(self, "_lm_refit_t", 0.0) >= 0.15:
+                    self._lm_refit_t = now
+                    self._rc_pose_gen = getattr(self, "_rc_pose_gen", 0) + 1
+                    self._refit_field_rotcam(live=True)
             self._redraw()
             return
         e = self._box_edit
@@ -3852,6 +3861,9 @@ class PtzTab(QWidget):
             return
         if self._lm_drag is not None:
             key, self._lm_drag = self._lm_drag, None
+            # 자세 캐시 무효화 — 안 하면 rotcam 라인이 드래그 전 자세로
+            # 계속 그려진다 (재캘리브만 하고 gen 을 안 올리던 버그).
+            self._rc_pose_gen = getattr(self, "_rc_pose_gen", 0) + 1
             self._refit_field(log_result=True)
             self._save_keyframes()
             self._refresh_field_list()
@@ -6996,9 +7008,12 @@ class PtzTab(QWidget):
             return None
         return float(R)
 
-    def _refit_field_rotcam(self):
+    def _refit_field_rotcam(self, live=False):
         """회전 카메라 필드 캘리브레이션 — 여러 프레임의 랜드마크를 기준
         프레임으로 이송해 합치고 원근 모델(rotcam) 피팅 (P06-3).
+
+        live=True (랜드마크 드래그 중): 직전 f 주변만 좁게 탐색해
+        수십 ms — 경기장 라인 라이브 갱신용. 전 범위는 놓을 때.
 
         위치를 아는 랜드마크만 사용(선 위 점 제외). 이 캘리브레이션은
         이 영상 자체 좌표계 — 다른 영상과의 정렬(same/opposite side)은
@@ -7023,6 +7038,8 @@ class PtzTab(QWidget):
         keys = [k for k in self.field_points
                 if k not in LINE_LANDMARKS and k not in VLINE_LANDMARKS
                 and k in pos]
+        prev = getattr(self, "_rc_calib", None)
+        f_hint = (float(prev["f"]) if live and prev is not None else None)
         self._rc_calib = None
         if len(keys) < 4:
             return
@@ -7062,7 +7079,8 @@ class PtzTab(QWidget):
                 line_fam.append(fam)
         cal = calibrate_reference_lines(
             px, fld, line_px, line_fam, (self.pano_w, self.pano_h),
-            length=self.field_size[0], width=self.field_size[1])
+            length=self.field_size[0], width=self.field_size[1],
+            f_hint=f_hint)
         if cal is not None:
             cal["ref_frame"] = ref
             self._rc_calib = cal
