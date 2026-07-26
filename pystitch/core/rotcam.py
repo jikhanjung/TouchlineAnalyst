@@ -152,19 +152,20 @@ def calibrate_reference_lines(px_pts, field_pts, line_px, line_fam, img_size,
       (2) cam_pos 고정, 라인 점 point-to-line 으로 (f, R) 정밀화
           (_refine_pose_p2l) — 라인이 소실점 방향으로 f 를 교정.
 
-    **폴백 정책 (사용자 방향)**: 라인은 점이 부족할 때만 쓴다. 점이
-    min_points 개 이상이면 잘 분포한 점만으로 f 가 충분히 안정적이고,
-    라인을 섞으면 오히려 분산이 커질 수 있어(합성 실측) 라인을 무시한다.
-    점이 min_points 미만(4~5개)일 때만 라인으로 f 를 보강한다.
+    **정책 (사용자 방향 2026-07-26)**: 라인 점이 있으면 **항상** 반영한다
+    — 공선 랜드마크(골라인 위 코너·골포스트·페널티박스 교차)의 라인
+    구속이, 선상 위치가 부정확해 점 대응이 기각된 랜드마크의 라인
+    정보를 되살린다 (가까운 코너 미지정 시 골라인 틀어짐 처방).
+    cam 고정 + f σ3% 앵커 + Huber 라 점 해를 크게 흔들지 않는다.
+    (구 폴백 정책 — 점 min_points 이상이면 라인 무시 — 는 폐기.
+    min_points 인자는 하위 호환용으로만 남음.)
 
     라인 점이 없으면 (1) 결과 그대로. line_fam: 각 라인 점의 패밀리
     (_marking_lines 인덱스; 가까운 터치라인=0, 먼=1, 골라인=2/3 …)."""
     base = calibrate_reference(px_pts, field_pts, img_size, f_hint=f_hint)
     if base is None:
         return None
-    # 점이 충분하면 라인 무시 (폴백 정책)
-    if (line_px is None or len(line_px) == 0
-            or len(field_pts) >= min_points):
+    if line_px is None or len(line_px) == 0:
         base["n_lines"] = 0
         return base
     ref = _refine_pose_p2l(line_px, line_fam,

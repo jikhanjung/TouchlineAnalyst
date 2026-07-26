@@ -57,6 +57,17 @@ LINE_FAMILIES = {
     "goal_r": (3, "오른쪽 골라인", (255, 120, 0)),
     "halfway": (4, "하프라인", (200, 100, 255)),
 }
+# 랜드마크 → 소속 경계 라인(_marking_lines 패밀리). 점 대응에 **더해**
+# point-to-line 구속으로도 넣는다 — 골라인 위 점들(코너·골포스트·페널티
+# 박스 교차)의 공선성 덕에, 가까운 코너가 선상 위치만 부정확(또는
+# RANSAC 기각)해도 골라인 자체는 그 점들의 라인 거리로 바로 추정된다
+# (사용자 방향 2026-07-26).
+LM_LINE_FAM = {
+    "corner_far_l": 2, "corner_near_l": 2, "goal_l_far": 2,
+    "goal_l_near": 2, "pen_l_far": 2, "pen_l_near": 2,
+    "corner_far_r": 3, "corner_near_r": 3, "goal_r_far": 3,
+    "goal_r_near": 3, "pen_r_far": 3, "pen_r_near": 3,
+}
 # 미리보기 오버레이용 랜드마크 약칭 (cv2 폰트는 한글 불가)
 LANDMARK_TAGS = {"corner_far_l": "FL", "corner_far_r": "FR",
                  "corner_near_l": "NL", "corner_near_r": "NR",
@@ -7060,7 +7071,7 @@ class PtzTab(QWidget):
             rec += [int(a[2]) for a in self.field_point_anchors.get(k, ())]
         ref = int(max(set(rec), key=rec.count)) if rec else \
             int(self.slider.value())
-        px, fld, skipped = [], [], 0
+        px, fld, used, skipped = [], [], [], 0
         for k in keys:
             got = self._rc_anchor_for(k, ref)      # 무효 체크 + 최단 앵커 이송
             if got is None:
@@ -7069,6 +7080,7 @@ class PtzTab(QWidget):
             p, _src = got
             px.append(p)
             fld.append([float(pos[k][0]), float(pos[k][1])])
+            used.append(k)
         if len(px) < 4:
             self._rc_skip = skipped
             return
@@ -7085,6 +7097,13 @@ class PtzTab(QWidget):
                     p = [float(v) for v in transfer_points(H, [p])[0]]
                 line_px.append(p)
                 line_fam.append(fam)
+        # 공선 랜드마크 → 소속 라인 point-to-line 구속 (LM_LINE_FAM):
+        # 골라인 위 점들이 점 대응에 더해 라인 거리로도 골라인을 잡는다.
+        for k, p in zip(used, px):
+            famk = LM_LINE_FAM.get(k)
+            if famk is not None:
+                line_px.append([float(p[0]), float(p[1])])
+                line_fam.append(famk)
         cal = calibrate_reference_lines(
             px, fld, line_px, line_fam, (self.pano_w, self.pano_h),
             length=self.field_size[0], width=self.field_size[1],
@@ -7345,7 +7364,7 @@ class PtzTab(QWidget):
         pos = landmark_positions(self.field_size[0], self.field_size[1],
                                  circle_r=self.field_circle_r)
         cam = np.asarray(rc["cam_pos"])
-        px, fld = [], []
+        px, fld, used = [], [], []
         for k in self.field_points:
             if k in LINE_LANDMARKS or k in VLINE_LANDMARKS or k not in pos:
                 continue
@@ -7355,12 +7374,45 @@ class PtzTab(QWidget):
             p, _src = got
             px.append(p)
             fld.append([float(pos[k][0]), float(pos[k][1])])
+            used.append(k)
         got = None
         if len(px) >= 3:
             # f_span 넓게 — 팬 뿐 아니라 줌도 프레임마다 흡수 (AX700 은
             # 드물지만 줌 함, 사용자 지적). 회전+줌 동시 추정.
             got = anchor_rotation(cam, px, fld, rc["f"],
                                   (self.pano_w, self.pano_h), f_span=0.35)
+        if got is not None:
+            # 라인 구속으로 (R, f) 정밀화 — 공선 랜드마크(골라인 등) +
+            # 수동 라인 점을 이 프레임으로 이송해 point-to-line. 선상
+            # 위치가 부정확한 점(가까운 코너 근사 클릭)도 라인 거리로는
+            # 골라인을 바르게 당긴다 (사용자 방향).
+            lp, lf = [], []
+            for k, p in zip(used, px):
+                famk = LM_LINE_FAM.get(k)
+                if famk is not None:
+                    lp.append([float(p[0]), float(p[1])])
+                    lf.append(famk)
+            from ..core.rotcam import _refine_pose_p2l, transfer_points
+            for key, pts in self.field_lines.items():
+                famk = LINE_FAMILIES[key][0]
+                for lx, ly, lfr in pts:
+                    q = [float(lx), float(ly)]
+                    if int(lfr) != cur:
+                        H = self._rc_H(int(lfr), cur)
+                        if H is None:
+                            continue
+                        q = [float(v) for v in transfer_points(H, [q])[0]]
+                    lp.append(q)
+                    lf.append(famk)
+            if lp:
+                ref2 = _refine_pose_p2l(
+                    lp, lf, {"R": got["R"], "f": got["f"]}, cam,
+                    (self.pano_w, self.pano_h),
+                    self.field_size[0], self.field_size[1])
+                if ref2 is not None:
+                    got = {"R": ref2["R"], "f": float(ref2["f"]),
+                           "K": ref2["K"],
+                           "res_deg": got.get("res_deg")}
         cache[cur] = got
         return got
 
