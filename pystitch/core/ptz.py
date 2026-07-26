@@ -147,14 +147,21 @@ def detect_raw(model, frame, det_w=2944, conf=0.2):
 
 def analyze_video(path, detect_every=3, det_w=None, field_top_frac=0.26,
                   weights=None, far_boost=True, far_band_frac=0.58,
+                  conf_near=0.2, conf_far=0.1,
                   cancel=None, progress=None, checkpoint_path=None,
                   checkpoint_every=1500, crop_hook=None, log=print):
     """1패스: 프레임 샘플마다 공/선수 검출. 반환 dict 는 JSON 직렬화 가능.
 
     field_top_frac 위(원경 트랙·관중석)의 공/선수는 장외로 버린다.
     far_boost: 원경 밴드(field_top~far_band_frac)를 원본 해상도 정사각 타일로
-    잘라 공 전용 추가 검출 — 전체 프레임은 ~50% 축소라 원경 공(~10px)이
-    뭉개지는 문제를 보완한다. 트래커 상태 보호를 위해 별도 모델 인스턴스 사용.
+    잘라 **공 + 사람** 추가 검출 — 전체 프레임은 ~50% 축소라 원경 공(~10px)·
+    원경 선수(수십 px)가 뭉개지는 문제를 보완한다 (사용자 방향: 원경 선수가
+    거의 안 잡히는데 수동 재검출(네이티브)은 잡힘). 트래커 상태 보호를 위해
+    별도 모델 인스턴스 사용. 타일 사람은 tid=-1 (추적기 밖 검출).
+
+    conf_near/conf_far: 사람 검출 이중 문턱 — 근측(화면 아래쪽)은
+    conf_near(0.2, FP 억제), 원경 밴드는 conf_far(0.1, 회수 우선 —
+    지금은 장외 자동 필터가 FP 를 기하로 거른다).
 
     checkpoint_path 지정 시 checkpoint_every 샘플마다 부분 결과를 저장하고,
     같은 조건(영상·파라미터·모델)의 체크포인트가 있으면 그 프레임부터 재개.
@@ -185,7 +192,8 @@ def analyze_video(path, detect_every=3, det_w=None, field_top_frac=0.26,
     i = 0
     ckpt_key = {"video": str(path), "detect_every": detect_every, "det_w": det_w,
                 "weights": str(weights or _DEFAULT_WEIGHTS),
-                "far_boost": bool(far_boost)}
+                "far_boost": bool(far_boost),
+                "conf_near": conf_near, "conf_far": conf_far}
     if checkpoint_path is not None and Path(checkpoint_path).exists():
         try:
             ck = _json.loads(Path(checkpoint_path).read_text())
@@ -226,10 +234,10 @@ def analyze_video(path, detect_every=3, det_w=None, field_top_frac=0.26,
             scale = det_w / frame.shape[1]
             small = cv2.resize(frame, None, fx=scale, fy=scale,
                                interpolation=cv2.INTER_AREA)
-            r = model.track(small, imgsz=det_w, conf=0.2,
+            r = model.track(small, imgsz=det_w, conf=min(conf_near, conf_far),
                             classes=[_CLS_PERSON, _CLS_BALL],
                             persist=True, verbose=False)[0]
-            far_balls = []
+            far_balls, far_persons = [], []
             if model_far is not None:
                 # 정사각형 타일: 학습 크기(~640) 분포에 맞고 네이티브 해상도 유지
                 y0b, y1b = int(field_top), int(pano_h * far_band_frac)
@@ -240,16 +248,23 @@ def analyze_video(path, detect_every=3, det_w=None, field_top_frac=0.26,
                 offs.append(strip.shape[1] - th)       # 우측 끝 보장
                 tiles = [strip[:, x:x + th] for x in offs]
                 imgsz_t = (th + 31) // 32 * 32
-                results = model_far.predict(tiles, imgsz=imgsz_t, conf=0.15,
-                                            classes=[_CLS_BALL], verbose=False)
+                results = model_far.predict(tiles, imgsz=imgsz_t,
+                                            conf=min(0.15, conf_far),
+                                            classes=[_CLS_BALL, _CLS_PERSON],
+                                            verbose=False)
                 for x_off, r2 in zip(offs, results):
                     for b2 in r2.boxes:
                         bx1, by1, bx2, by2 = b2.xyxy[0].tolist()
-                        far_balls.append([
-                            round((bx1 + bx2) / 2 + x_off, 1),
-                            round((by1 + by2) / 2 + y0b, 1),
-                            round(float(b2.conf[0]), 3),
-                            round(bx2 - bx1, 1), round(by2 - by1, 1)])
+                        c2 = float(b2.conf[0])
+                        row = [round((bx1 + bx2) / 2 + x_off, 1),
+                               round((by1 + by2) / 2 + y0b, 1),
+                               round(c2, 3),
+                               round(bx2 - bx1, 1), round(by2 - by1, 1)]
+                        if int(b2.cls[0]) == _CLS_BALL:
+                            if c2 >= 0.15:
+                                far_balls.append(row)
+                        elif c2 >= conf_far:   # 원경 사람 (네이티브 해상도)
+                            far_persons.append(row)
             hsv = cv2.cvtColor(small, cv2.COLOR_BGR2HSV)
             bcands = []                            # 이 샘플의 공 후보들
             prow = []
@@ -264,6 +279,11 @@ def analyze_video(path, detect_every=3, det_w=None, field_top_frac=0.26,
                                    round((x2 - x1) / scale, 1),
                                    round((y2 - y1) / scale, 1)])
                     continue
+                # 사람 이중 문턱: 근측은 conf_near(FP 억제), 원경 밴드는
+                # conf_far(회수 우선 — 장외 자동 필터가 FP 를 거른다)
+                if conf < conf_near and not (
+                        cys <= pano_h * far_band_frac and conf >= conf_far):
+                    continue
                 tid = int(b_.id[0]) if b_.id is not None else -1
                 # 유니폼 색: 박스 상반신(위 절반, 가로 중앙 60%) HSV 평균
                 tx1 = int(x1 + (x2 - x1) * 0.2)
@@ -274,6 +294,25 @@ def analyze_video(path, detect_every=3, det_w=None, field_top_frac=0.26,
                 prow.append([round(cxs, 1), round(cys, 1),
                              round((x2 - x1) / scale, 1), round((y2 - y1) / scale, 1),
                              tid, round(hm, 1), round(sm, 1), round(vm, 1)])
+            # 원경 네이티브 '사람' 병합 — 절반 해상도 메인 패스가 놓친
+            # 원경 선수 보완 (tid=-1: 추적기 밖). 기존 박스와 근접하면
+            # 중복 제거, conf 순으로 넣어 타일 겹침 중복도 자체 정리.
+            far_persons.sort(key=lambda p: -p[2])
+            for fx, fy, fc, fw_, fh_ in far_persons:
+                if any((fx - p[0]) ** 2 + (fy - p[1]) ** 2
+                       < max(fw_, 25.0) ** 2 for p in prow):
+                    continue
+                ty1, ty2 = int(fy - fh_ / 2), int(fy)
+                tx1, tx2 = int(fx - fw_ * 0.3), int(fx + fw_ * 0.3)
+                torso = frame[max(ty1, 0):max(ty2, 1), max(tx1, 0):max(tx2, 1)]
+                if torso.size:
+                    hm, sm, vm = (cv2.cvtColor(torso, cv2.COLOR_BGR2HSV)
+                                  .reshape(-1, 3).mean(axis=0).tolist())
+                else:
+                    hm = sm = vm = 0.0
+                prow.append([round(fx, 1), round(fy, 1), round(fw_, 1),
+                             round(fh_, 1), -1,
+                             round(hm, 1), round(sm, 1), round(vm, 1)])
             # 원경 네이티브 검출 병합 → 근접 중복 제거 후 상위 3개 저장.
             # 후보 다수 보존: 미끼가 conf 를 이겨도 진짜 공이 살아남아
             # 트랙 연결 단계에서 별도 트랙으로 경쟁할 수 있다.
@@ -311,6 +350,7 @@ def analyze_video(path, detect_every=3, det_w=None, field_top_frac=0.26,
             "pano_w": pano_w, "pano_h": pano_h,
             "detect_every": detect_every, "det_w": det_w,
             "field_top_frac": field_top_frac,
+            "conf_near": conf_near, "conf_far": conf_far,
             "frames": frames_idx, "balls": balls, "ball_cands": ball_cands,
             "players": players}
 
