@@ -273,11 +273,19 @@ def analyze_video(path, detect_every=3, det_w=None, field_top_frac=0.26,
     import time
     t0 = time.perf_counter()
     i = 0
+    # src_size/mtime 포함 — 같은 경로에 파노라마를 다시 인코드(예: roll
+    # 보정 재수출)하면 구 영상 기준 체크포인트가 이어붙는 사고 방지.
+    try:
+        st_src = Path(str(path)).stat()
+        src_key = {"src_size": st_src.st_size,
+                   "src_mtime": int(st_src.st_mtime)}
+    except OSError:
+        src_key = {}
     ckpt_key = {"video": str(path), "detect_every": detect_every, "det_w": det_w,
                 "weights": str(weights or _DEFAULT_WEIGHTS),
                 "far_boost": bool(far_boost),
                 "conf_near": conf_near, "conf_far": conf_far,
-                "tracker": Path(str(tracker_cfg)).name}
+                "tracker": Path(str(tracker_cfg)).name, **src_key}
     if checkpoint_path is not None and Path(checkpoint_path).exists():
         try:
             ck = _json.loads(Path(checkpoint_path).read_text())
