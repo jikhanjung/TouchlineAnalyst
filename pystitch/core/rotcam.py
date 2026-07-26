@@ -26,27 +26,13 @@ def make_K(f, w, h):
                      [0.0, 0.0, 1.0]])
 
 
-def calibrate_reference(px_pts, field_pts, img_size, f_frac=(0.4, 3.0),
-                        steps=40):
-    """기준 프레임 랜드마크 → {f, K, R, t, cam_pos, rms_px}.
-
-    px_pts: 이미지 픽셀 [(u, v)], field_pts: 필드 [(X, Y)] (z=0),
-    img_size: (w, h). f 를 [f_frac]×폭 구간에서 탐색(거친 스캔 →
-    황금분할)하며 평면 PnP 재투영 오차 최소화. 점 4개 이상.
-    """
-    w, h = img_size
-    obj = np.array([[x, y, 0.0] for x, y in field_pts], np.float64)
-    img = np.array(px_pts, np.float64)
-    if len(obj) < 4:
-        return None
-
+def _fscan_pnp(obj, img, w, h, f_frac, steps):
+    """f 1D 탐색 + 평면 PnP(IPPE) → {f,K,R,t,cam_pos,rms_px,rvec,tvec}
+    또는 None. 필드 점은 모두 z=0 평면 → IPPE(평면 전용, 4점부터).
+    ITERATIVE 는 OpenCV 5.0 에서 4점 평면을 DLT 로 처리하려다 예외를
+    내며 앱을 죽였다. 퇴화 배치는 IPPE 도 예외 → 잡아서 무한대 오차."""
     def solve(f):
         K = make_K(f, w, h)
-        # 필드 점은 모두 z=0 평면 → IPPE(평면 전용 PnP, 4점부터). 예전
-        # ITERATIVE 는 OpenCV 5.0 에서 4점 평면을 DLT 로 처리하려다
-        # "6점 필요"로 예외를 내며 앱을 죽였다. 퇴화 배치(예: 3점 공선)면
-        # IPPE 도 예외를 내므로 잡아서 무한대 오차로 강등 — 캘리브 없음
-        # (크래시 대신 오버레이 미표시).
         try:
             ok, rvec, tvec = cv2.solvePnP(obj, img, K, None,
                                           flags=cv2.SOLVEPNP_IPPE)
@@ -79,9 +65,60 @@ def calibrate_reference(px_pts, field_pts, img_size, f_frac=(0.4, 3.0),
     rvec, tvec = sol
     R, _ = cv2.Rodrigues(rvec)
     t = tvec.reshape(3)
-    cam_pos = (-R.T @ t)
     return {"f": float(f), "K": make_K(f, w, h), "R": R, "t": t,
-            "cam_pos": cam_pos, "rms_px": rms,
+            "cam_pos": (-R.T @ t), "rms_px": rms,
+            "rvec": rvec, "tvec": tvec}
+
+
+def calibrate_reference(px_pts, field_pts, img_size, f_frac=(0.4, 3.0),
+                        steps=40, reject_px=40.0, min_keep=6):
+    """기준 프레임 랜드마크 → {f, K, R, t, cam_pos, rms_px}.
+
+    px_pts: 이미지 픽셀 [(u, v)], field_pts: 필드 [(X, Y)] (z=0),
+    img_size: (w, h). f 를 [f_frac]×폭 구간에서 탐색하며 평면 PnP
+    재투영 오차 최소화. 점 4개 이상.
+
+    **이상치 강건 (RANSAC)**: solvePnP 는 최소제곱이라 랜드마크 하나의
+    프레임 간 이송이 엉뚱하면(먼 코너의 긴 호모그래피 체인 등) 그 한 점이
+    전체 자세(cam_pos·f)를 틀어 필드가 엉뚱하게 그려진다. 탐욕적 잔차
+    제거는 적합이 이상치 쪽으로 끌려가 이상치가 가려지므로 실패 —
+    각 f 후보에서 solvePnPRansac 으로 최대 합의 inlier 집합을 찾고
+    (f 는 inlier 수·inlier rms 로 선택), 그 inlier 로 정밀 재적합한다.
+    reject_px: RANSAC 재투영 inlier 문턱(px)."""
+    w, h = img_size
+    obj = np.array([[x, y, 0.0] for x, y in field_pts], np.float64)
+    img = np.array(px_pts, np.float64)
+    n = len(obj)
+    if n < 4:
+        return None
+    # 1) 이상치 배제 — f 거친 스캔 × RANSAC, (inlier 수, -rms) 최대 선택
+    best = None
+    for f in np.linspace(f_frac[0] * w, f_frac[1] * w, steps):
+        K = make_K(f, w, h)
+        try:
+            ok, rvec, tvec, inl = cv2.solvePnPRansac(
+                obj, img, K, None, reprojectionError=reject_px,
+                iterationsCount=100, flags=cv2.SOLVEPNP_IPPE)
+        except cv2.error:
+            continue
+        if not ok or inl is None or len(inl) < 4:
+            continue
+        idx = inl.ravel()
+        proj, _ = cv2.projectPoints(obj[idx], rvec, tvec, K, None)
+        rms = float(np.sqrt(np.mean(np.sum(
+            (proj.reshape(-1, 2) - img[idx]) ** 2, axis=1))))
+        key = (len(idx), -rms)
+        if best is None or key > best[0]:
+            best = (key, idx)
+    keep = best[1] if (best is not None and len(best[1]) >= 4) \
+        else np.arange(n)                       # RANSAC 실패 시 전점 폴백
+    # 2) inlier(정상점)로 정밀 f·자세 — 이 집합은 깨끗하니 비강건 IPPE
+    sol = _fscan_pnp(obj[keep], img[keep], w, h, f_frac, steps)
+    if sol is None:
+        return None
+    return {"f": sol["f"], "K": sol["K"], "R": sol["R"], "t": sol["t"],
+            "cam_pos": sol["cam_pos"], "rms_px": sol["rms_px"],
+            "n_points": int(len(keep)), "n_rejected": int(n - len(keep)),
             "img_size": (int(w), int(h))}
 
 
@@ -215,12 +252,23 @@ def anchor_rotation(cam_pos, px_pts, field_pts, f_init, img_size,
         rc = (np.linalg.inv(K)
               @ np.hstack([px, np.ones((len(px), 1))]).T).T
         rc = rc / np.linalg.norm(rc, axis=1, keepdims=True)
-        M = rc.T @ rw
-        U, _s, Vt = np.linalg.svd(M)
-        d = np.sign(np.linalg.det(U @ Vt))
-        R = U @ np.diag([1.0, 1.0, d]) @ Vt
-        cosang = np.clip(np.sum(rc * (rw @ R.T), axis=1), -1.0, 1.0)
-        return float(np.rad2deg(np.mean(np.arccos(cosang)))), R
+        # IRLS 재가중 Kabsch — 이송이 엉뚱한 랜드마크(광선) 하나가 R 을
+        # 통째로 틀지 않게 잔차 큰 점을 부드럽게 강등(Cauchy 가중). 정상점
+        # 만 있으면 가중≈1 이라 기존과 동일. 정상점 3개 미만이면 무의미.
+        wts = np.ones(len(rc))
+        R = np.eye(3)
+        ang = np.zeros(len(rc))
+        for _ in range(4):
+            M = (rc * wts[:, None]).T @ rw
+            U, _s, Vt = np.linalg.svd(M)
+            d = np.sign(np.linalg.det(U @ Vt))
+            R = U @ np.diag([1.0, 1.0, d]) @ Vt
+            cosang = np.clip(np.sum(rc * (rw @ R.T), axis=1), -1.0, 1.0)
+            ang = np.arccos(cosang)
+            delta = max(2.0 * float(np.median(ang)), np.radians(0.5))
+            wts = 1.0 / (1.0 + (ang / delta) ** 2)
+        res = float(np.rad2deg(np.sum(wts * ang) / max(np.sum(wts), 1e-9)))
+        return res, R
 
     a, b = f_init * (1 - f_span), f_init * (1 + f_span)
     g = (np.sqrt(5) - 1) / 2

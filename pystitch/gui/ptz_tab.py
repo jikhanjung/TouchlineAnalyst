@@ -6925,8 +6925,9 @@ class PtzTab(QWidget):
         self._field_calib = None
         if getattr(self, "_is_rotcam", False):
             self._refit_field_rotcam()
-            return self._field_status()
-        if self.pano_w and len(self.field_points) >= 4:
+            # (이 아래 상태줄 갱신까지 흐르게 — 예전엔 여기서 early return
+            #  이라 rotcam 은 lbl_field_status 가 이전 영상 값으로 고정됐다)
+        elif self.pano_w and len(self.field_points) >= 4:
             self._field_calib = fit_field_calibration(
                 self.field_points, self.pano_w, self.pano_h,
                 length=self.field_size[0], width=self.field_size[1],
@@ -6939,9 +6940,11 @@ class PtzTab(QWidget):
             if rc is not None:
                 cp = rc["cam_pos"]
                 sk = getattr(self, "_rc_skip", 0)
+                rej = rc.get("n_rejected", 0)
                 msg = (f"회전 카메라 캘리브레이션 OK — f {rc['f']:.0f}px, "
                        f"설치 ({cp[0]:+.0f},{cp[1]:+.0f},{cp[2]:.1f})m, "
-                       f"잔차 {rc['rms_px']:.1f}px"
+                       f"잔차 {rc['rms_px']:.1f}px ({rc.get('n_points', 0)}점)"
+                       + (f", 이상치 {rej}개 제외" if rej else "")
                        + (f", 이송실패 {sk}개" if sk else ""))
             elif npos >= 4:
                 msg = ("회전 캘리브레이션 실패 — 프레임 간 이송 실패 "
