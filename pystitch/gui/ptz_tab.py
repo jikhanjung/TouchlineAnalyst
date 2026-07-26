@@ -4068,23 +4068,30 @@ class PtzTab(QWidget):
         radar_pts = []
         if si is not None:
             prow = self._players_row(si)
-            # rotcam 장외 숨김: 트랙릿 일괄 판정(파노라마) 대신 현재
-            # 프레임 자세로 발밑을 지면 투영해 피치 밖을 거른다 — 자세를
-            # 못 푼 프레임은 필터 없이 전부 표시 (엉뚱하게 숨기느니 안전).
+            # rotcam: 현재 프레임 자세 — 장외 필터·레이더 지면 투영 공용.
+            # 자세를 못 푼 프레임은 둘 다 생략 (엉뚱한 근사보다 안전).
+            rc_pose = rc_cam = None
             if (getattr(self, "_is_rotcam", False)
                     and getattr(self, "_rc_calib", None) is not None
-                    and self.check_infield.isChecked() and prow):
-                pose = self._rc_current_pose(int(f))
-                if pose is not None:
-                    from ..core.rotcam import pixel_to_field
-                    ok_rows = [pp for pp in prow if len(pp) >= 4]
-                    if ok_rows:
-                        fxy = pixel_to_field(
-                            pose["K"], pose["R"],
-                            np.asarray(self._rc_calib["cam_pos"], float),
-                            [(pp[0], pp[1] + pp[3] / 2.0) for pp in ok_rows])
-                        hl = self.field_size[0] / 2.0 + self._INFIELD_MARGIN
-                        hw = self.field_size[1] / 2.0 + self._INFIELD_MARGIN
+                    and (self.check_infield.isChecked()
+                         or self.check_radar.isChecked())):
+                rc_pose = self._rc_current_pose(int(f))
+                if rc_pose is not None:
+                    rc_cam = np.asarray(self._rc_calib["cam_pos"], float)
+            # rotcam 장외 숨김: 트랙릿 일괄 판정(파노라마) 대신 현재
+            # 프레임 자세로 발밑을 지면 투영해 피치 밖을 거른다.
+            if rc_pose is not None and self.check_infield.isChecked() and prow:
+                from ..core.rotcam import pixel_to_field
+                ok_rows = [pp for pp in prow if len(pp) >= 4]
+                if ok_rows:
+                    fxy = pixel_to_field(
+                        rc_pose["K"], rc_pose["R"], rc_cam,
+                        [(pp[0], pp[1] + pp[3] / 2.0) for pp in ok_rows])
+                    hl = self.field_size[0] / 2.0 + self._INFIELD_MARGIN
+                    hw = self.field_size[1] / 2.0 + self._INFIELD_MARGIN
+                    # 전원이 NaN(캘리브 이상)이면 필터 자체를 생략 —
+                    # 전원 숨김 사고 방지
+                    if np.isfinite(fxy).all(axis=1).any():
                         drop = {id(pp) for pp, (gx, gy) in zip(ok_rows, fxy)
                                 if not (np.isfinite(gx) and abs(gx) <= hl
                                         and abs(gy) <= hw)}
@@ -4182,6 +4189,29 @@ class PtzTab(QWidget):
                     g = pano_to_field(self._field_calib, [[bb[0], bb[1]]])[0]
                     if np.isfinite(g[0]):
                         ball_g = (float(g[0]), float(g[1]))
+            elif rc_pose is not None:
+                # rotcam: 프레임별 자세로 발밑 지면 투영 — 경기장 절대
+                # 좌표 레이더. (예전엔 파노라마용 근사(ground_positions)로
+                # 떨어져 선수들이 근측 사이드라인에 뭉쳐 보였다.)
+                from ..core.rotcam import pixel_to_field
+                ok_rows = [pp for pp in prow if len(pp) >= 4]
+                if ok_rows:
+                    fxy = pixel_to_field(
+                        rc_pose["K"], rc_pose["R"], rc_cam,
+                        [(pp[0], pp[1] + pp[3] / 2.0) for pp in ok_rows])
+                    for (gx, gy), pp in zip(fxy, ok_rows):
+                        if np.isfinite(gx):
+                            tid = int(pp[4]) if len(pp) >= 5 else -1
+                            radar_pts.append((tid if tid >= 0 else None,
+                                              float(gx), float(gy),
+                                              self._role_of(tid)))
+                if bb is not None:
+                    g = pixel_to_field(rc_pose["K"], rc_pose["R"], rc_cam,
+                                       [[bb[0], bb[1]]])[0]
+                    if np.isfinite(g[0]):
+                        ball_g = (float(g[0]), float(g[1]))
+            elif getattr(self, "_is_rotcam", False):
+                pass    # rotcam 인데 자세 없음 — 엉뚱한 근사보다 빈 레이더
             else:
                 # 캘리브레이션 전: 카메라 기준 근사를 경기장 좌표계로 이동
                 # (build_radar_data 와 동일한 가정 위치)

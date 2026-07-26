@@ -33,17 +33,30 @@ def _fscan_pnp(obj, img, w, h, f_frac, steps):
     내며 앱을 죽였다. 퇴화 배치는 IPPE 도 예외 → 잡아서 무한대 오차."""
     def solve(f):
         K = make_K(f, w, h)
+        # 평면(z=0) 점만으론 지면 반사 이중해가 생긴다 — 카메라가 지면
+        # 아래(z<0)인 거울해도 재투영이 (특히 망원=약한 원근에서) 거의
+        # 같다. 거울해가 뽑히면 pixel_to_field(지면 투영)가 전부 NaN 이
+        # 되므로, 양해를 다 받아(solvePnPGeneric) 물리해(z>0)를 우선.
         try:
-            ok, rvec, tvec = cv2.solvePnP(obj, img, K, None,
-                                          flags=cv2.SOLVEPNP_IPPE)
+            got = cv2.solvePnPGeneric(obj, img, K, None,
+                                      flags=cv2.SOLVEPNP_IPPE)
+            rvecs, tvecs = got[1], got[2]
         except cv2.error:
             return np.inf, None
-        if not ok:
+        best = None                        # ((지면아래?, rms), sol)
+        for rvec, tvec in zip(rvecs, tvecs):
+            proj, _ = cv2.projectPoints(obj, rvec, tvec, K, None)
+            rms = float(np.sqrt(np.mean(
+                np.sum((proj.reshape(-1, 2) - img) ** 2, axis=1))))
+            if not np.isfinite(rms):
+                continue
+            R, _ = cv2.Rodrigues(rvec)
+            below = bool((-R.T @ tvec.reshape(3))[2] <= 0.0)
+            if best is None or (below, rms) < best[0]:
+                best = ((below, rms), rms, (rvec, tvec))
+        if best is None:
             return np.inf, None
-        proj, _ = cv2.projectPoints(obj, rvec, tvec, K, None)
-        rms = float(np.sqrt(np.mean(
-            np.sum((proj.reshape(-1, 2) - img) ** 2, axis=1))))
-        return rms, (rvec, tvec)
+        return best[1], best[2]
 
     fs = np.linspace(f_frac[0] * w, f_frac[1] * w, steps)
     errs = [solve(f)[0] for f in fs]
