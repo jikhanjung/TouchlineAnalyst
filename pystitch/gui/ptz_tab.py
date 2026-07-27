@@ -4036,7 +4036,10 @@ class PtzTab(QWidget):
         # 드래그(이동)/모서리 핸들(줌)로 편집 가능 — 놓으면 줌 키프레임 커밋.
         self._plan_box = None
         if self.plan is not None and not picking \
-                and self.check_crop.isChecked() and f < len(self.plan["cx"]):
+                and self.check_crop.isChecked() and f < len(self.plan["cx"]) \
+                and np.isfinite(self.plan["cx"][f]) \
+                and np.isfinite(self.plan["cy"][f]) \
+                and np.isfinite(self.plan["crop_w"][f]):
             ow, oh = self.plan_out
             tl = self.plan.get("top_lim")
             top = (int(tl[f]) if tl is not None and f < len(tl)

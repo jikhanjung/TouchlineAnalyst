@@ -1426,6 +1426,21 @@ def build_plan(analysis, pano_w, pano_h, out_w=1920, out_h=1080,
             f"빠른 추종 구간 {(w > 0.5).mean():.0%}, "
             f"줌아웃(>1.05x) {(cw > out_w * 1.05).mean():.0%}"
             + (f", 상단 완화 {m.mean():.0%}" if m.any() else ""))
+    # NaN 방어: 대상(공·선수)이 전혀 없는 구간은 스무딩이 NaN 을 남길 수
+    # 있다 (#11 실측: 열자마자 int(NaN) 크래시) — 유한값 사이는 보간,
+    # 양끝은 np.interp 특성상 홀드, 전부 NaN 이면 파노라마 중심/최대 폭.
+    def _finite_fill(a, default):
+        a = np.asarray(a, float)
+        m = np.isfinite(a)
+        if not m.any():
+            return np.full(len(a), float(default))
+        if not m.all():
+            idx = np.arange(len(a), dtype=float)
+            a = np.interp(idx, idx[m], a[m])
+        return a
+    cx = _finite_fill(cx, pano_w / 2.0)
+    cy = _finite_fill(cy, pano_h / 2.0)
+    cw = _finite_fill(cw, max_crop_w)
     return {"cx": cx, "cy": cy, "crop_w": cw, "top_margin": top_margin,
             "top_lim": top_lim}
 
