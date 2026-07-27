@@ -18,5 +18,15 @@
   "length": 92.0,
   "width": 62.0,
   "circle_r": 9.0
+ },
+ "서울시인재개발원": {
+  "length": 100.0,
+  "width": 62.0,
+  "circle_r": 9.0
+ },
+ "서울교대": {
+  "length": 102.0,
+  "width": 64.0,
+  "circle_r": 9.0
  }
 }

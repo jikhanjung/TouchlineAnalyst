@@ -1857,6 +1857,7 @@ class PtzTab(QWidget):
         self.field_size = [105.0, 68.0]   # 경기장 길이×폭 (m)
         self.field_circle_r = CENTER_CIRCLE_R  # 센터서클 반지름(m) — 경기장별
         self.field_circle_auto = True     # 중앙선 4점에서 R 자동 추정
+        self.venue_name = None            # 이 영상의 venue 이름 (명시 선택)
         self._field_calib = None          # fit_field_calibration 결과
         self.extra_players: dict[int, list] = {}  # {샘플si: [[cx,cy,w,h,id]]}
         self._next_extra_id = 900001      # 수동 검출 ID (분석 ID와 분리)
@@ -3069,6 +3070,7 @@ class PtzTab(QWidget):
         self.field_point_anchors = {}
         self.line_points = []
         self._top_black = None                # 상단 검은 경계 캐시 (영상 고정값)
+        self.venue_name = None
         self.extra_players = {}
         self.kit_colors = {}
         self.user_events = []
@@ -3114,6 +3116,7 @@ class PtzTab(QWidget):
             self.line_points = [list(p) for p in doc.get("line_points", [])]
             _tb = doc.get("top_black")
             self._top_black = int(_tb) if _tb is not None else None
+            self.venue_name = doc.get("venue") or None
             self.extra_players = {int(si): [list(p) for p in rows]
                                   for si, rows in
                                   (doc.get("extra_players") or {}).items()}
@@ -3158,6 +3161,7 @@ class PtzTab(QWidget):
                     sp.blockSignals(True)
                     sp.setValue(float(v))
                     sp.blockSignals(False)
+            self._reflect_venue_combo()   # 저장된 venue 이름 → 콤보 표시
             self.analysis = doc.get("analysis")   # 구 통합본 (이전 대상)
         migrated = self.analysis is not None
         ap = self._analysis_path()
@@ -3221,6 +3225,7 @@ class PtzTab(QWidget):
                                        self.field_point_anchors,
                                    "top_black": getattr(self, "_top_black",
                                                         None),
+                                   "venue": getattr(self, "venue_name", None),
                                    "field_size": self.field_size,
                                    "field_circle_r": self.field_circle_r,
                                    "field_circle_auto": self.field_circle_auto,
@@ -6928,9 +6933,16 @@ class PtzTab(QWidget):
                 return key
         return None
 
+    def _venue_cleared_by_manual(self):
+        """치수를 직접 수정하면 venue 선택 해제 (더는 그 규격이 아님)."""
+        if getattr(self, "venue_name", None):
+            self.venue_name = None
+            self._reflect_venue_combo()
+
     def _field_size_changed(self, _v=None):
         self.field_size = [self.spin_field_len.value(),
                            self.spin_field_w.value()]
+        self._venue_cleared_by_manual()
         self._refit_field()
         self._save_keyframes()
         self._redraw()
@@ -6943,6 +6955,7 @@ class PtzTab(QWidget):
             self.chk_circle_auto.blockSignals(False)
             self.field_circle_auto = False
         self.field_circle_r = float(v)
+        self._venue_cleared_by_manual()
         self._refit_field()
         self._save_keyframes()
         self._redraw()
@@ -6999,11 +7012,20 @@ class PtzTab(QWidget):
         self.chk_circle_auto.blockSignals(True)
         self.chk_circle_auto.setChecked(False)
         self.chk_circle_auto.blockSignals(False)
+        self.venue_name = name            # 영상별 명시 선택 — 사이드카 저장
         self._refit_field()
         self._save_keyframes()
         self._redraw()
         self.log(f"[field] venue '{name}' 적용: {self.field_size[0]}×"
                  f"{self.field_size[1]}m, 서클R {self.field_circle_r}m")
+
+    def _reflect_venue_combo(self):
+        """사이드카에 저장된 venue 이름을 콤보에 반영 (열 때)."""
+        name = getattr(self, "venue_name", None)
+        self.combo_venue.blockSignals(True)
+        idx = self.combo_venue.findText(name) if name else -1
+        self.combo_venue.setCurrentIndex(idx if idx > 0 else 0)
+        self.combo_venue.blockSignals(False)
 
     def _save_venue_dialog(self):
         from PyQt6.QtWidgets import QInputDialog
