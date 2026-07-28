@@ -84,4 +84,4 @@ Modan2 는 대조용 (동일 명령 체계 확인).
 - [x] 1-3 PyInstaller spec (단일 COLLECT, exe 2개)
 - [x] 1-4 InnoSetup (TouchlineLabs, per-user)
 - [x] 1-5 CI workflows (node24 세대 액션: checkout@v5/setup-python@v6/artifact@v5)
-- [ ] 1-6 CI 첫 실행 그린
+- [x] 1-6 CI 그린 (3라운드: spec/.gitignore 충돌 → ffmpeg·인코딩 → Windows 테스트 4종. 인스톨러 261MB 아티팩트)
