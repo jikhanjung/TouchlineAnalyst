@@ -492,6 +492,62 @@ def _analyze(pano: Path, args):
     return cache
 
 
+def _build_match(pano: Path, args):
+    """pano ↔ AX700 영상을 호각 동기로 연결 → <pano>.match.json.
+
+    headless 가 이미 아는 연관(GoPro 체인→pano)과 호각 대역상관으로 찾은
+    AX700 시계 모델을 경기 파일로 만들어 PitchWatch "경기 열기" 로 바로
+    불러온다 (사용자 방향). 호각 매칭이 부족한 영상(옆 구장·다른 경기)은
+    제외 — 이 게이트가 곧 '어느 AX700 이 이 경기인가' 판정이다."""
+    from .core.match import MATCH_SUFFIX, save_match
+    out = pano.with_suffix(MATCH_SUFFIX)
+    if out.exists() and not args.force:
+        _log(f"[match] {out.name} 있음 — 건너뜀")
+        return
+    from .core.audio import (extract_audio, load_whistle_track,
+                             save_whistle_track, whistle_events,
+                             whistle_track)
+    from .core.sync_multi import sync_by_whistles
+
+    def events_of(p: Path):
+        _tr, ev = load_whistle_track(p)
+        if _tr is not None:
+            return ev
+        _log(f"[match] 호각 트랙 계산: {p.name} (오디오 추출 — 수 분)")
+        x = extract_audio(str(p))
+        tr = whistle_track(x)
+        ev = whistle_events(tr)
+        save_whistle_track(p, tr, ev)
+        return ev
+
+    ev_p = events_of(pano)
+    alts = []
+    for d in args.ax700:
+        vids = sorted(set(Path(d).glob("*.MP4")) | set(Path(d).glob("*.mp4")))
+        for v in vids:
+            try:
+                r = sync_by_whistles(ev_p, events_of(v))
+            except Exception as e:  # noqa: BLE001 — 개별 영상 실패는 건너뜀
+                _log(f"[match] {v.name} 동기 실패 (무시): {e}")
+                continue
+            if not r or r["n"] < 4 or r["rms_s"] > 1.0:
+                _log(f"[match] {v.name}: 호각 매칭 부족 — 제외"
+                     + (f" (n={r['n']}, rms={r['rms_s']:.2f}s)" if r else ""))
+                continue
+            alts.append({"video": str(v),
+                         "clock": {"offset": r["offset"],
+                                   "drift": r["drift"]},
+                         "stage": "whistle"})
+            _log(f"[match] 연결: {v.name} offset {r['offset']:+.1f}s "
+                 f"drift {r['drift']:.6f} (호각 {r['n']}쌍, "
+                 f"rms {r['rms_s']:.2f}s)")
+    save_match(out, {"title": pano.stem,
+                     "halves": [{"label": "경기", "primary": str(pano),
+                                 "alts": alts}]})
+    _log(f"[match] 경기 파일 생성: {out.name} (alt {len(alts)}개)"
+         + ("" if alts else " — AX700 매칭 없음"))
+
+
 def _far_augment(pano: Path, args):
     """기존 분석에 원경 타일 사람 검출만 추가 (tid 800001+, 편집 보존)."""
     from .core.ptz import analysis_summary, augment_far_persons
@@ -638,6 +694,12 @@ def process_pair(pair, out_dir: Path, lens, lens_name, args) -> Path:
             _whistle(pano, args)          # 내부 스킵 로그만
     except Exception as e:  # noqa: BLE001 — 호각은 부가 산출물, 파이프라인 유지
         _log(f"[whistle] 실패 (계속 진행): {e}")
+    if args.ax700:
+        try:
+            with tm.stage("match"):
+                _build_match(pano, args)
+        except Exception as e:  # noqa: BLE001 — 경기 파일도 부가 산출물
+            _log(f"[match] 실패 (계속 진행): {e}")
     if args.no_ocr:
         return pano
     if "ocr_numbers" in load_events_doc(pano) and not args.force:
@@ -696,6 +758,11 @@ def main(argv=None) -> int:
                     help="기존 .analysis.json 이 있어도 분석을 처음부터 다시 "
                          "(신 검출 코드 전체 반영). 주의: 트랙릿 tid 가 전부 "
                          "바뀌어 기존 수동 편집(역할·병합·번호) 연결이 끊김")
+    ap.add_argument("--ax700", nargs="*", default=[], metavar="DIR",
+                    help="AX700(회전캠) 영상 디렉터리 — 각 파노라마와 호각 "
+                         "대역상관으로 시계를 맞춰 <pano>.match.json 자동 "
+                         "생성 (PitchWatch '경기 열기'로 로드). 매칭 부족한 "
+                         "영상(옆 구장 등)은 자동 제외")
     ap.add_argument("--far-augment", action="store_true",
                     help="기존 분석에 원경 네이티브 타일 '사람' 검출만 추가 "
                          "(tid 800001+). 기존 트랙릿·수동 편집 보존 — 편집한 "
