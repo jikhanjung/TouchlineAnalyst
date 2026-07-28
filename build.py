@@ -19,6 +19,12 @@ import sys
 import tempfile
 from pathlib import Path
 
+# Windows CI 콘솔은 cp1252 — 한글 로그가 UnicodeEncodeError 로 죽으며
+# 진짜 빌드 오류를 가렸다 (첫 CI 실행 실측). UTF-8 로 강제.
+for _s in (sys.stdout, sys.stderr):
+    if hasattr(_s, "reconfigure"):
+        _s.reconfigure(encoding="utf-8", errors="replace")
+
 PROJECT_ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(PROJECT_ROOT))
 from version import __version__ as VERSION  # noqa: E402
