@@ -14,7 +14,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 from PyQt6.QtCore import (
-    QEvent, QRect, QSettings, Qt, QThread, QTimer, pyqtSignal,
+    QEvent, QRect, Qt, QThread, QTimer, pyqtSignal,
 )
 from PyQt6.QtWidgets import QApplication, QCheckBox
 from PyQt6.QtGui import (
@@ -39,6 +39,7 @@ from ..core.ptz import (
     ground_positions, link_ball_tracks, propagate_seed, ptz_available,
     analysis_summary, render_plan, same_spot_spans, tracklet_colors,
 )
+from .settings import app_settings
 from .widgets import FramePane
 
 
@@ -158,7 +159,7 @@ class TimelineView(QWidget):
     def __init__(self):
         super().__init__()
         self.lanes = list(self.LANES)     # 인스턴스 사본 (팀 이름 반영)
-        saved = QSettings("PyStitch360", "PyStitch360").value(
+        saved = app_settings().value(
             "ptz_timeline_lanes", None)
         try:
             self.lane_h = [max(10, min(240, int(v))) for v in saved]
@@ -171,7 +172,7 @@ class TimelineView(QWidget):
         # _apply_height 가 참조하므로 그 전에 초기화
         try:
             self.collapsed = {int(v) for v in
-                              QSettings("PyStitch360", "PyStitch360")
+                              app_settings()
                               .value("ptz_timeline_collapsed", []) or []}
         except (TypeError, ValueError):
             self.collapsed = set()
@@ -471,7 +472,7 @@ class TimelineView(QWidget):
             self.collapsed = set()
         else:
             self.collapsed = others
-        QSettings("PyStitch360", "PyStitch360").setValue(
+        app_settings().setValue(
             "ptz_timeline_collapsed", [int(v) for v in self.collapsed])
         self._apply_height()
         self.update()
@@ -479,7 +480,7 @@ class TimelineView(QWidget):
     def expand_all(self):
         if self.collapsed:
             self.collapsed = set()
-            QSettings("PyStitch360", "PyStitch360").setValue(
+            app_settings().setValue(
                 "ptz_timeline_collapsed", [])
             self._apply_height()
             self.update()
@@ -489,7 +490,7 @@ class TimelineView(QWidget):
             self.collapsed.discard(lane)
         else:
             self.collapsed.add(lane)
-        QSettings("PyStitch360", "PyStitch360").setValue(
+        app_settings().setValue(
             "ptz_timeline_collapsed", [int(v) for v in self.collapsed])
         self._apply_height()
         self.update()
@@ -950,7 +951,7 @@ class TimelineView(QWidget):
     def mouseReleaseEvent(self, ev):
         if self._resize is not None:
             self._resize = None
-            QSettings("PyStitch360", "PyStitch360").setValue(
+            app_settings().setValue(
                 "ptz_timeline_lanes", [int(v) for v in self.lane_h])
             return
         pr, self._press = self._press, None
@@ -1422,7 +1423,7 @@ class ExportDialog(QDialog):
 
         self.combo_codec = QComboBox()
         self.combo_codec.addItems(list(encoders))
-        saved = QSettings("PyStitch360", "PyStitch360").value(
+        saved = app_settings().value(
             "ptz_export_codec", "")
         labels = list(encoders)
         if saved in labels:                       # 직전 선택 기억
@@ -1496,7 +1497,7 @@ class ExportDialog(QDialog):
         """선택 결과: {start, end, wide, codec_name, crf, radar, path}."""
         use_marks = self.export_range and self.combo_range.currentIndex() == 0
         f0, f1 = (self.export_range if use_marks else (0, self.total))
-        QSettings("PyStitch360", "PyStitch360").setValue(
+        app_settings().setValue(
             "ptz_export_codec", self.combo_codec.currentText())
         return {"start": int(f0), "end": int(f1),
                 "wide": self.combo_mode.currentIndex() == 1,
@@ -1732,7 +1733,7 @@ class HighlightExportDialog(QDialog):
 
         self.combo_codec = QComboBox()
         self.combo_codec.addItems(list(encoders))
-        saved = QSettings("PyStitch360", "PyStitch360").value(
+        saved = app_settings().value(
             "ptz_export_codec", "")
         labels = list(encoders)
         if saved in labels:
@@ -1785,7 +1786,7 @@ class HighlightExportDialog(QDialog):
 
     def config(self):
         """선택 결과: {indices, dir, codec_name, crf, radar}."""
-        QSettings("PyStitch360", "PyStitch360").setValue(
+        app_settings().setValue(
             "ptz_export_codec", self.combo_codec.currentText())
         idx = [i for i in range(self.list.count())
                if self.list.item(i).checkState() == Qt.CheckState.Checked]
@@ -1915,7 +1916,7 @@ class PtzTab(QWidget):
         self.mc = None                    # MulticamViewer — 경기 열 때 생성
         self._opening_match = False
         self._build_ui()
-        st = QSettings("PyStitch360", "PyStitch360")
+        st = app_settings()
         for cb, key in ((self.check_players, "ptz_show_players"),
                         (self.check_ball, "ptz_show_ball"),
                         (self.check_crop, "ptz_show_crop"),
@@ -1923,12 +1924,12 @@ class PtzTab(QWidget):
                         (self.check_radar_smooth, "ptz_radar_smooth")):
             cb.setChecked(st.value(key, "true") == "true")
             cb.toggled.connect(
-                lambda on, k=key: (QSettings("PyStitch360", "PyStitch360")
+                lambda on, k=key: (app_settings()
                                    .setValue(k, "true" if on else "false"),
                                    self._redraw()))
         self.sld_radar_alpha.setValue(int(st.value("ptz_radar_alpha", 55)))
         self.sld_radar_alpha.valueChanged.connect(
-            lambda v: (QSettings("PyStitch360", "PyStitch360")
+            lambda v: (app_settings()
                        .setValue("ptz_radar_alpha", int(v)),
                        self._redraw()))
         # 스페이스 = 재생/정지 — 포커스가 아니라 커서 위치 기준이라
@@ -2107,7 +2108,7 @@ class PtzTab(QWidget):
         self.combo_model.setToolTip(
             "공/선수 검출 모델. GPU 추론이라 큰 모델도 부담 적음 —\n"
             "정확도가 아쉬우면 yolo11s/m 권장. 이름 모델은 최초 1회 자동 다운로드.")
-        saved_model = QSettings("PyStitch360", "PyStitch360").value("ptz_model", 0)
+        saved_model = app_settings().value("ptz_model", 0)
         self.combo_model.setCurrentIndex(int(saved_model))
         self.combo_model.currentIndexChanged.connect(self._model_changed)
         top.addWidget(self.combo_model)
@@ -2163,7 +2164,7 @@ class PtzTab(QWidget):
             ov_row.addWidget(cb)
         # 장외 숨김: 저장된 설정 복원 + 토글 시 장외 재판정·계획 갱신
         self.check_infield.setChecked(
-            QSettings("PyStitch360", "PyStitch360")
+            app_settings()
             .value("ptz_infield_only", "true") == "true")
         self.check_infield.toggled.connect(self._infield_toggled)
         # 멀티캠 카메라/모드 바 (경기 열면 채워짐 — _rebuild_mc_bar)
@@ -2212,7 +2213,7 @@ class PtzTab(QWidget):
                               self._toggle_mute, 0, 5)
         self.btn_mute.setCheckable(True)
         self.btn_mute.setChecked(
-            QSettings("PyStitch360", "PyStitch360")
+            app_settings()
             .value("ptz_muted", "false") == "true")
         if self.btn_mute.isChecked():
             self.btn_mute.setText("🔇")
@@ -2464,14 +2465,14 @@ class PtzTab(QWidget):
         self._rows.addWidget(w_strip)
         self._rows.setStretchFactor(0, 1)     # 창 리사이즈 여분은 영상에
         self._rows.setCollapsible(0, False)
-        saved_rows = QSettings("PyStitch360", "PyStitch360").value(
+        saved_rows = app_settings().value(
             "ptz_row_sizes", None)
         try:
             self._rows.setSizes([max(0, int(s)) for s in saved_rows])
         except Exception:  # noqa: BLE001
             self._rows.setSizes([520, 260, 210])
         self._rows.splitterMoved.connect(
-            lambda *_: QSettings("PyStitch360", "PyStitch360").setValue(
+            lambda *_: app_settings().setValue(
                 "ptz_row_sizes", [int(s) for s in self._rows.sizes()]))
         v.addWidget(self._rows, 1)
 
@@ -2487,7 +2488,7 @@ class PtzTab(QWidget):
         bottom.addWidget(lbl_fz)
         self.spin_far_zoom = QDoubleSpinBox(decimals=2, minimum=1.0, maximum=1.5,
                                             singleStep=0.05)
-        self.spin_far_zoom.setValue(float(QSettings("PyStitch360", "PyStitch360")
+        self.spin_far_zoom.setValue(float(app_settings()
                                           .value("ptz_far_zoom", 1.0)))
         self.spin_far_zoom.valueChanged.connect(self._far_zoom_changed)
         bottom.addWidget(self.spin_far_zoom)
@@ -3260,7 +3261,7 @@ class PtzTab(QWidget):
                     "yolo11n.pt", "yolo11s.pt", "yolo11m.pt", None]
 
     def _model_changed(self, i):
-        st = QSettings("PyStitch360", "PyStitch360")
+        st = app_settings()
         if self._MODEL_NAMES[i] is None:      # 사용자 .pt
             path, _ = QFileDialog.getOpenFileName(
                 self, "YOLO 가중치 (.pt)", "", "PyTorch 가중치 (*.pt)")
@@ -3275,7 +3276,7 @@ class PtzTab(QWidget):
         """선택된 모델의 가중치 경로/이름 (None=내장 기본 yolov8n)."""
         name = self._MODEL_NAMES[self.combo_model.currentIndex()]
         if name is None:
-            custom = QSettings("PyStitch360", "PyStitch360").value("ptz_model_custom", "")
+            custom = app_settings().value("ptz_model_custom", "")
             return str(custom) if custom else None
         if name == "yolov8n.pt":
             return None                        # presets/yolov8n.pt (내장)
@@ -3402,7 +3403,7 @@ class PtzTab(QWidget):
     def _toggle_mute(self):
         muted = self.btn_mute.isChecked()
         self.btn_mute.setText("🔇" if muted else "🔊")
-        QSettings("PyStitch360", "PyStitch360").setValue(
+        app_settings().setValue(
             "ptz_muted", "true" if muted else "false")
         if self._audio:
             self._audio_out.setMuted(muted)
@@ -3432,7 +3433,7 @@ class PtzTab(QWidget):
             return
         # 재생 표시 폭 상한 (QSettings ptz_play_w, 기본 1600) — 원본이 이미
         # 작으면(프록시) 그대로. 화질을 약간 낮춰 재생 부하를 줄인다.
-        play_w = int(QSettings("PyStitch360", "PyStitch360")
+        play_w = int(app_settings()
                      .value("ptz_play_w", 1600))
         # 재생 소스: 프록시(.scrub.mp4)가 있으면 그것 (원본 5900px 디코드
         # 회피). 없으면 원본을 읽으며 disp_w 로 온더플라이 축소.
@@ -4849,7 +4850,7 @@ class PtzTab(QWidget):
 
 
     def _far_zoom_changed(self, v):
-        QSettings("PyStitch360", "PyStitch360").setValue("ptz_far_zoom", v)
+        app_settings().setValue("ptz_far_zoom", v)
         self._plan_dirty()
 
     def _plan_dirty(self):
@@ -5268,7 +5269,7 @@ class PtzTab(QWidget):
                 if self._outfield else self.hidden_players)
 
     def _infield_toggled(self, on):
-        QSettings("PyStitch360", "PyStitch360").setValue(
+        app_settings().setValue(
             "ptz_infield_only", "true" if on else "false")
         self._update_outfield()
         self._refresh_team_label()
@@ -5900,7 +5901,7 @@ class PtzTab(QWidget):
                 "\"하이라이트 후보 생성\"을 먼저 실행하세요.")
             return
         self._stop_play()
-        st = QSettings("PyStitch360", "PyStitch360")
+        st = app_settings()
         clock_avail = self._clock_config() is not None
         # 동기화된 다른 카메라 (sync_cams.py 결과, P06)
         alt = None
@@ -8200,7 +8201,7 @@ class PtzTab(QWidget):
         if self.analysis is None or self.pano_path is None:
             return
         self._stop_play()
-        st = QSettings("PyStitch360", "PyStitch360")
+        st = app_settings()
         clock_avail = self._clock_config() is not None
         dlg = ExportDialog(
             self, self.total, self.fps, self._norm_export_range(),

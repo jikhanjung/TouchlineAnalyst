@@ -1,0 +1,55 @@
+# TouchlineAnalyst 패키징/도구 설정 (P10 — CTHarvester 체계 이식)
+
+[build-system]
+requires = ["setuptools>=68.0.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "TouchlineAnalyst"
+# Version is NOT hardcoded here. version.py is the single source of truth;
+# see [tool.setuptools.dynamic] below.
+dynamic = ["version"]
+description = "아마추어 축구 경기 영상 파이프라인 — 듀얼 GoPro 스티칭(PitchStitch) + 경기 분석(PitchWatch)"
+readme = "README.md"
+# 3.12 단일 (CTHarvester 근거 준용: CI 단순화, 배포본은 인터프리터 동봉)
+requires-python = ">=3.12,<3.13"
+license = { text = "MIT" }
+authors = [{ name = "TouchlineLabs" }]
+
+dependencies = [
+    "PyQt6>=6.6",
+    "opencv-python>=4.9",
+    "numpy>=1.26",
+    "platformdirs>=4.0",
+    "semver>=3.0",
+]
+
+[project.optional-dependencies]
+# 경기 분석(PitchWatch) 스택 — PitchStitch 는 이것 없이 기동한다
+analysis = [
+    "ultralytics>=8.3",
+    "torch>=2.2",
+    "easyocr>=1.7",
+]
+build = [
+    "pyinstaller>=6.6",
+]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.4",
+]
+
+[tool.setuptools]
+py-modules = ["version"]
+packages = ["pystitch", "pystitch.core", "pystitch.gui"]
+
+[tool.setuptools.dynamic]
+# version.py is the single source of truth; declaring it in py-modules above is
+# what lets setuptools resolve this attr reference.
+version = { attr = "version.__version__" }
+
+# pytest 설정은 기존 pytest.ini 가 담당 (이중 정의 방지)
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"

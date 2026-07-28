@@ -9,7 +9,7 @@ PtzTab 을 자체 메인 윈도우로 승격: 파노라마 mp4 를 직접 연다
 import sys
 from pathlib import Path
 
-from PyQt6.QtCore import QSettings
+from pystitch.gui.settings import app_settings
 from PyQt6.QtWidgets import QApplication, QFileDialog, QMainWindow
 
 from pystitch.gui.ptz_tab import PtzTab
@@ -33,11 +33,11 @@ class PitchWatchWindow(QMainWindow):
         print(msg, flush=True)
 
     def _last_dir(self) -> str:
-        return str(QSettings("PyStitch360", "PyStitch360")
+        return str(app_settings()
                    .value("last_video_dir", ""))
 
     def _remember_dir(self, d: str):
-        QSettings("PyStitch360", "PyStitch360").setValue("last_video_dir", d)
+        app_settings().setValue("last_video_dir", d)
 
     # ------------------------------------------------------------ 메뉴
     def _build_menu(self):
@@ -91,7 +91,7 @@ class PitchWatchWindow(QMainWindow):
 
     # ------------------------------------------------------------ 최근 파일
     def _recent(self) -> list[str]:
-        v = QSettings("PyStitch360", "PyStitch360").value(
+        v = app_settings().value(
             "pitchwatch_recent", [])
         if isinstance(v, str):            # 원소 1개 리스트가 str 로 올 수 있음
             v = [v]
@@ -99,7 +99,7 @@ class PitchWatchWindow(QMainWindow):
 
     def _remember_recent(self, path):
         lst = [str(path)] + [p for p in self._recent() if p != str(path)]
-        QSettings("PyStitch360", "PyStitch360").setValue(
+        app_settings().setValue(
             "pitchwatch_recent", lst[:_MAX_RECENT])
         self._rebuild_recent()
 
@@ -187,7 +187,7 @@ class PitchWatchWindow(QMainWindow):
         self.open_match(path)
 
     def _recent_matches(self) -> list[str]:
-        v = QSettings("PyStitch360", "PyStitch360").value(
+        v = app_settings().value(
             "pitchwatch_recent_matches", [])
         if isinstance(v, str):
             v = [v]
@@ -196,7 +196,7 @@ class PitchWatchWindow(QMainWindow):
     def _remember_recent_match(self, path):
         lst = [str(path)] + [p for p in self._recent_matches()
                              if p != str(path)]
-        QSettings("PyStitch360", "PyStitch360").setValue(
+        app_settings().setValue(
             "pitchwatch_recent_matches", lst[:_MAX_RECENT])
         self._rebuild_recent_matches()
 

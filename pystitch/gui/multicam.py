@@ -17,13 +17,14 @@ import time
 from pathlib import Path
 
 import cv2
-from PyQt6.QtCore import QSettings, Qt, QThread, pyqtSignal
+from PyQt6.QtCore import Qt, QThread, pyqtSignal
 from PyQt6.QtWidgets import (
     QDialog, QDialogButtonBox, QFileDialog, QHBoxLayout, QLabel, QListWidget,
     QPlainTextEdit, QPushButton, QVBoxLayout,
 )
 
 from ..core.match import to_alt_time
+from .settings import app_settings
 from .widgets import FramePane
 
 
@@ -131,7 +132,7 @@ class AltPane(FramePane):
     def mouseReleaseEvent(self, ev):
         if self._drag is not None:
             self._drag = None
-            st = QSettings("PyStitch360", "PyStitch360")
+            st = app_settings()
             st.setValue("mc_pip_geo", [self.x(), self.y(),
                                        self.width(), self.height()])
 
@@ -164,7 +165,7 @@ class MulticamViewer:
         self._log = log_fn
         self.alts: list[dict] = []            # [{video, clock}]
         self.focus = 0                        # 0=primary, 1..=alt
-        self.mode = str(QSettings("PyStitch360", "PyStitch360")
+        self.mode = str(app_settings()
                         .value("mc_mode", "pip"))
         if self.mode not in self.MODES:
             self.mode = "pip"
@@ -201,7 +202,7 @@ class MulticamViewer:
     def set_mode(self, mode: str):
         if mode in self.MODES:
             self.mode = mode
-            QSettings("PyStitch360", "PyStitch360").setValue("mc_mode", mode)
+            app_settings().setValue("mc_mode", mode)
             self._main_frame = None
             self._apply_layout()
             if self._redraw:
@@ -222,7 +223,7 @@ class MulticamViewer:
                 p.setParent(None)
             p.floating = True
             p.setParent(self._pane)
-            geo = QSettings("PyStitch360", "PyStitch360").value("mc_pip_geo")
+            geo = app_settings().value("mc_pip_geo")
             try:
                 x, y, w, h = [int(v) for v in geo]
                 p.setGeometry(x, y, w, h)

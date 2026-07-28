@@ -11,7 +11,7 @@ import os
 import sys
 from pathlib import Path
 
-from PyQt6.QtCore import QSettings, Qt, QTimer
+from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog, QGridLayout, QGroupBox,
     QHBoxLayout, QLabel, QListWidget, QMainWindow, QMessageBox, QPlainTextEdit,
@@ -24,6 +24,7 @@ from ..core.encoders import available_encoders
 from ..core.lens import LensProfile, builtin_profiles
 from ..core.project import load_project, save_project
 from ..core.ptz import ptz_available
+from .settings import app_settings
 from .widgets import FramePane
 from .workers import (
     AlignWorker, ExportWorker, GpmfWorker, PlaybackWorker, PreviewWorker,
@@ -142,7 +143,7 @@ class MainWindow(QMainWindow):
     _MAX_RECENT = 10
 
     def _recent_projects(self) -> list[str]:
-        v = QSettings("PyStitch360", "PyStitch360").value("recent_projects", [])
+        v = app_settings().value("recent_projects", [])
         if isinstance(v, str):          # QSettings 는 원소 1개 리스트를 str 로 돌려줄 수 있음
             v = [v]
         out, seen = [], set()
@@ -166,7 +167,7 @@ class MainWindow(QMainWindow):
         canon = self._canon(path)
         paths = [str(Path(path))] + [p for p in self._recent_projects()
                                      if self._canon(p) != canon]
-        QSettings("PyStitch360", "PyStitch360").setValue(
+        app_settings().setValue(
             "recent_projects", paths[: self._MAX_RECENT])
         self._rebuild_recent_menu()
 
@@ -183,7 +184,7 @@ class MainWindow(QMainWindow):
             self._recent_menu.addAction("목록 비우기", self._clear_recent)
 
     def _clear_recent(self):
-        QSettings("PyStitch360", "PyStitch360").remove("recent_projects")
+        app_settings().remove("recent_projects")
         self._rebuild_recent_menu()
 
     def _open_recent(self, path: str):
@@ -425,10 +426,10 @@ class MainWindow(QMainWindow):
         """영상 열기 대화상자 시작 폴더: 현재 열린 영상 → 최근 사용 폴더."""
         if self.files_l:
             return str(Path(self.files_l[0]).parent)
-        return str(QSettings("PyStitch360", "PyStitch360").value("last_video_dir", ""))
+        return str(app_settings().value("last_video_dir", ""))
 
     def _remember_video_dir(self, d: str):
-        QSettings("PyStitch360", "PyStitch360").setValue("last_video_dir", d)
+        app_settings().setValue("last_video_dir", d)
 
     def _open_video(self, side: str):
         path, _ = QFileDialog.getOpenFileName(
