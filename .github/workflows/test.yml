@@ -1,0 +1,48 @@
+# 테스트 CI (P10 — CTHarvester test.yml 간소 이식)
+# 코드 품질 게이트(ruff format/mypy 등)는 후속 — 지금은 ruff advisory 만.
+name: Tests
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_call:  # release.yml 이 릴리스를 이 워크플로로 게이트
+
+jobs:
+  lint:
+    name: Lint (ruff, advisory)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - run: pip install ruff
+      # advisory — 실패해도 게이트하지 않음 (P10 결정: code quality 후속)
+      - run: ruff check --output-format=github . || true
+
+  test:
+    name: Tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        # 실사용 대상 = Windows, 개발 환경 = WSL(Linux). macOS 는 대상 아님.
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+      - name: Install test dependencies
+        # 테스트는 core(수학) 만 건드린다 — GUI/torch 불필요.
+        # opencv-python-headless: CI 에 GUI 라이브러리 없이 cv2 제공.
+        run: |
+          python -m pip install --upgrade pip
+          pip install numpy opencv-python-headless platformdirs semver pytest
+      - name: Run tests
+        run: python -m pytest tests/ -q

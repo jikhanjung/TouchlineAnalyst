@@ -1,0 +1,89 @@
+# 태그(v*.*.*) → 테스트 게이트 → 빌드 → GitHub Release (P10 이식)
+name: Release
+
+permissions:
+  contents: write
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+jobs:
+  # version.py(SSOT)와 태그 불일치 릴리스 차단 — 손으로 민 태그의 드리프트
+  # 방지 (CTHarvester 준용).
+  verify-version:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Tag matches version.py
+        run: |
+          FILE_VERSION="$(python -c 'import re,pathlib; print(re.search(r"__version__\s*=\s*\"([^\"]+)\"", pathlib.Path("version.py").read_text()).group(1))')"
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          echo "version.py: $FILE_VERSION / tag: $TAG_VERSION"
+          if [ "$FILE_VERSION" != "$TAG_VERSION" ]; then
+            echo "::error::Tag $GITHUB_REF_NAME does not match version.py ($FILE_VERSION)."
+            exit 1
+          fi
+
+  test:
+    needs: verify-version
+    uses: ./.github/workflows/test.yml
+
+  compute-build-number:
+    needs: verify-version
+    runs-on: ubuntu-latest
+    outputs:
+      build_number: ${{ steps.bn.outputs.build_number }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - id: bn
+        run: echo "build_number=$(git rev-list --count HEAD)" >> "$GITHUB_OUTPUT"
+
+  call-build-workflow:
+    needs: [test, compute-build-number]
+    uses: ./.github/workflows/reusable_build.yml
+    with:
+      build_number: ${{ needs.compute-build-number.outputs.build_number }}
+
+  create-release:
+    needs: [compute-build-number, call-build-workflow]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v5
+        with:
+          path: release-files/
+
+      - name: Generate SHA256 checksums
+        run: |
+          cd release-files
+          find . -type f -name "*.exe" -exec sha256sum {} \; > ../SHA256SUMS.txt
+          cd ..
+          cat SHA256SUMS.txt
+
+      - name: Extract changelog section
+        # CHANGELOG.md 의 해당 버전 섹션을 릴리스 본문으로 (bump_version.py
+        # 가 [Unreleased] 를 버전으로 바꿔둔다).
+        run: |
+          python - <<'EOF'
+          import pathlib, re
+          ver = "${{ github.ref_name }}".lstrip("v")
+          text = pathlib.Path("CHANGELOG.md").read_text(encoding="utf-8")
+          m = re.search(rf"^## \[{re.escape(ver)}\].*?(?=^## \[|\Z)", text,
+                        re.M | re.S)
+          body = m.group(0).strip() if m else f"Release {ver}"
+          pathlib.Path("RELEASE_BODY.md").write_text(body, encoding="utf-8")
+          EOF
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          body_path: RELEASE_BODY.md
+          files: |
+            release-files/**/*.exe
+            SHA256SUMS.txt

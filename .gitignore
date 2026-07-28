@@ -163,3 +163,9 @@ Thumbs.db
 *.part
 *.webm
 *.ytdl
+
+# P10 빌드 산출물
+build/
+dist/
+InnoSetup/Output/
+*.egg-info/

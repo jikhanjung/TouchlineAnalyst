@@ -1,0 +1,63 @@
+# 재사용 빌드 (P10 — CTHarvester reusable_build.yml 이식, Windows 전용).
+# PyInstaller(단일 onedir 에 PitchStitch+PitchWatch) → InnoSetup 인스톨러.
+name: Reusable Build Workflow
+on:
+  workflow_call:
+    inputs:
+      build_number:
+        required: true
+        type: string
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install dependencies
+        # Windows PyPI torch = CPU 빌드 (P10 결정: CPU 번들, GPU 는 소스
+        # 실행 경로 문서화). analysis+build extras 로 전체 스택 설치.
+        run: |
+          python -m pip install --upgrade pip
+          pip install ".[analysis,build]"
+
+      - name: Get Version String
+        id: get_version
+        shell: bash
+        run: echo "VERSION=$(python -c 'from version import __version__; print(__version__)')" >> $GITHUB_OUTPUT
+
+      - name: Download and Install Inno Setup
+        shell: pwsh
+        run: |
+          # jrsoftware.org 는 최신 6.x 만 유지해 고정 URL 이 404 가 된 전례
+          # — GitHub 릴리스 자산은 영구적이라 거기서 고정 (CTHarvester 준용).
+          $inno_url = "https://github.com/jrsoftware/issrc/releases/download/is-6_7_3/innosetup-6.7.3.exe"
+          Invoke-WebRequest -Uri $inno_url -OutFile innosetup-installer.exe
+          Start-Process -FilePath innosetup-installer.exe -ArgumentList "/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /SP-" -Wait
+          if (Test-Path "C:\Program Files (x86)\Inno Setup 6\ISCC.exe") {
+            echo "C:\Program Files (x86)\Inno Setup 6" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          } else {
+            echo "ERROR: Inno Setup installation failed"; exit 1
+          }
+
+      - name: Build Executables and Installer
+        shell: pwsh
+        run: |
+          $env:BUILD_NUMBER = "${{ inputs.build_number }}"
+          python build.py
+          if (Test-Path "InnoSetup/Output") { Get-ChildItem "InnoSetup/Output" -Name }
+
+      - name: Upload installer artifact
+        uses: actions/upload-artifact@v5
+        with:
+          name: touchlineanalyst-windows-installer
+          path: InnoSetup/Output/TouchlineAnalyst_v${{ steps.get_version.outputs.VERSION }}_build${{ inputs.build_number }}_Installer.exe
+          if-no-files-found: error

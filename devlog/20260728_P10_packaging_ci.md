@@ -79,9 +79,9 @@ Modan2 는 대조용 (동일 명령 체계 확인).
 
 ## 3. 진행 상태
 
-- [ ] 1-1 버전 SSOT
-- [ ] 1-2 paths/설정
-- [ ] 1-3 PyInstaller spec
-- [ ] 1-4 InnoSetup
-- [ ] 1-5 CI workflows
+- [x] 1-1 버전 SSOT
+- [x] 1-2 paths/설정 (42곳 치환, 구 설정 1회 이관)
+- [x] 1-3 PyInstaller spec (단일 COLLECT, exe 2개)
+- [x] 1-4 InnoSetup (TouchlineLabs, per-user)
+- [x] 1-5 CI workflows (node24 세대 액션: checkout@v5/setup-python@v6/artifact@v5)
 - [ ] 1-6 CI 첫 실행 그린

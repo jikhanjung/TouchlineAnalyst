@@ -1,0 +1,31 @@
+# main push 마다 인스톨러 빌드 (P10 — CTHarvester build.yml 이식)
+name: Build
+
+permissions:
+  contents: write  # reusable_build 의 아티팩트 업로드용
+
+on:
+  push:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+jobs:
+  # 빌드 번호 = 커밋 수 (github.run_number 는 워크플로별이라 build/release/
+  # manual-release 3경로에서 일관되지 않음 — CTHarvester 근거 준용).
+  compute-build-number:
+    if: "!contains(github.event.head_commit.message, '[skip ci]')"
+    runs-on: ubuntu-latest
+    outputs:
+      build_number: ${{ steps.bn.outputs.build_number }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - id: bn
+        run: echo "build_number=$(git rev-list --count HEAD)" >> "$GITHUB_OUTPUT"
+
+  call-build:
+    needs: compute-build-number
+    uses: ./.github/workflows/reusable_build.yml
+    with:
+      build_number: ${{ needs.compute-build-number.outputs.build_number }}

@@ -1,0 +1,51 @@
+; Inno Setup script template for TouchlineAnalyst (Windows installer).
+; build.py fills {{VERSION}} and rewrites every ..\ path below to an absolute
+; one before running ISCC (CTHarvester 체계 이식, P10). BUILD_NUMBER comes
+; from the environment.
+;
+; Runtime data is NOT installed or removed by this script — settings live in
+; %LOCALAPPDATA%\TouchlineLabs\TouchlineAnalyst\settings.ini (platformdirs)
+; and must survive an uninstall. 분석 사이드카는 영상 옆에 저장된다.
+#define AppVersion "{{VERSION}}"
+#define BuildNumber GetEnv('BUILD_NUMBER')
+
+[Setup]
+; Stable identity for upgrades and uninstall — generated once, never change.
+; The doubled brace is Inno's escape for a literal `{`.
+AppId={{7E4A2C91-8B3D-4F6A-9C15-D2E8A7B4F310}
+AppName=TouchlineAnalyst
+AppVersion={#AppVersion}
+AppPublisher=TouchlineLabs
+AppPublisherURL=https://github.com/jikhanjung/TouchlineAnalyst
+AppSupportURL=https://github.com/jikhanjung/TouchlineAnalyst
+AppUpdatesURL=https://github.com/jikhanjung/TouchlineAnalyst
+; Per-user install: no elevation ({userpf} = %LOCALAPPDATA%\Programs).
+PrivilegesRequired=lowest
+DefaultDirName={userpf}\TouchlineLabs\TouchlineAnalyst
+UninstallDisplayIcon={app}\PitchWatch.exe
+DisableProgramGroupPage=yes
+OutputDir=..\InnoSetup\Output
+OutputBaseFilename=TouchlineAnalyst_v{#AppVersion}_build{#BuildNumber}_Installer
+; Conservative compression — solid/max archives trip AV heuristics on unsigned
+; installers (Modan2/CTHarvester 전례).
+Compression=lzma/normal
+SolidCompression=no
+WizardStyle=modern
+
+[Languages]
+Name: "english"; MessagesFile: "compiler:Default.isl"
+
+[Tasks]
+Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
+
+[Files]
+; onedir 빌드 전체 (PitchStitch.exe + PitchWatch.exe 동일 폴더)
+Source: "..\dist\TouchlineAnalyst\*"; DestDir: "{app}"; Flags: recursesubdirs createallsubdirs
+
+[Icons]
+Name: "{userprograms}\TouchlineLabs\PitchWatch"; Filename: "{app}\PitchWatch.exe"
+Name: "{userprograms}\TouchlineLabs\PitchStitch"; Filename: "{app}\PitchStitch.exe"
+Name: "{userdesktop}\PitchWatch"; Filename: "{app}\PitchWatch.exe"; Tasks: desktopicon
+
+[Run]
+Filename: "{app}\PitchWatch.exe"; Description: "{cm:LaunchProgram,PitchWatch}"; Flags: postinstall shellexec nowait skipifsilent
