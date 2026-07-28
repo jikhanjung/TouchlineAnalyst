@@ -462,7 +462,9 @@ def _analyze(pano: Path, args):
         now = time.perf_counter()
         if now - last[0] >= 30:
             last[0] = now
-            rem = (total - i) / max(fps * args.detect_every, 1e-6) / 60
+            # fps 는 이미 '영상 프레임/초' (i 가 매 프레임 증가) —
+            # detect_every 로 또 나누면 ETA 가 3배 과소 (0389/0390 실측)
+            rem = (total - i) / max(fps, 1e-6) / 60
             _log(f"[analyze] {i}/{total} ({i/total*100:.1f}%) "
                  f"{fps:.1f}fps 남은 ~{rem:.0f}분")
 
