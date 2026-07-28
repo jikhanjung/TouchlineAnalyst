@@ -27,6 +27,10 @@ jobs:
     name: Tests (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: 20
+    env:
+      # Windows 러너 콘솔은 cp1252 — 한글 로그를 찍는 자식 파이썬
+      # (subprocess 테스트)이 UnicodeEncodeError 로 죽는다 (CI 실측)
+      PYTHONIOENCODING: utf-8
     strategy:
       fail-fast: false
       matrix:

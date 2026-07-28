@@ -34,8 +34,17 @@ def find_chapters(first_file: str | Path) -> list[Path]:
 def group_directory(directory: str | Path) -> list[list[Path]]:
     """디렉터리의 GoPro 파일들을 영상 단위(챕터 체인)로 그룹핑."""
     directory = Path(directory)
-    groups = []
+    # Windows(대소문자 무시 FS)에선 *.MP4 와 *.mp4 가 같은 파일을 둘 다
+    # 매칭해 그룹이 중복된다 (CI 실측) — 소문자 이름으로 중복 제거.
+    seen: set[str] = set()
+    files = []
     for p in sorted(directory.glob("*.MP4")) + sorted(directory.glob("*.mp4")):
+        if p.name.lower() in seen:
+            continue
+        seen.add(p.name.lower())
+        files.append(p)
+    groups = []
+    for p in files:
         if _FIRST.match(p.name):
             groups.append(find_chapters(p))
     return groups

@@ -192,6 +192,7 @@ def test_alignment_rejects_degenerate_frames(lens):
 
 def test_worker_attrs_do_not_shadow_qthread_api():
     """QThread 메서드(start 등)를 속성이 가리면 GUI가 abort 로 죽는다."""
+    pytest.importorskip("PyQt6")          # CI 테스트 환경엔 GUI 스택 없음
     from pystitch.gui.workers import ExportWorker, PlaybackWorker
 
     w = ExportWorker(None, [], [], [], 0.0, 0.0, 60.0, "out.mp4")
@@ -207,7 +208,8 @@ def test_project_resolves_cross_platform_paths(tmp_path):
 
     # WSL 에 존재하는 파일 — 저장소 이름에 독립적으로 저장소 자신을 쓴다
     real = (Path(__file__).resolve().parents[1] / "README.md")
-    assert str(real).startswith("/mnt/"), "WSL 전용 테스트"
+    if not str(real).startswith("/mnt/"):
+        pytest.skip("WSL 전용 테스트 (경로 변환 대상이 /mnt/*)")
     drive = real.parts[2]                                  # /mnt/<drive>/...
     win_style = f"{drive.upper()}:\\" + "\\".join(real.parts[3:])
     a = Alignment(Rh=np.eye(3), yaw_split_deg=40.0,
