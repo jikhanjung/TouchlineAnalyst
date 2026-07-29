@@ -656,6 +656,56 @@ class _StageTimer:
         return _Ctx()
 
 
+def _venues_path() -> Path:
+    return Path(__file__).resolve().parents[1] / "presets" / "venues.json"
+
+
+def load_venues() -> dict:
+    p = _venues_path()
+    if not p.exists():
+        return {}
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001 — 프리셋이 깨져도 파이프라인은 진행
+        return {}
+
+
+def _seed_venue(pano: Path, name: str, force: bool = False):
+    """경기장 프리셋을 <pano>.ptz.json 에 미리 넣는다 (GUI venue 선택과 동일).
+
+    .ptz.json 은 사용자 편집 사이드카라 **기존 값을 덮지 않는다** — 이미
+    다른 venue 가 적혀 있으면 로그만 남기고 둔다 (--force 로 강제).
+    """
+    v = load_venues().get(name)
+    if not v:
+        _log(f"[venue] 프리셋 없음: {name} — 건너뜀")
+        return
+    sp = pano.with_suffix(".ptz.json")
+    doc = {}
+    if sp.exists():
+        try:
+            doc = json.loads(sp.read_text(encoding="utf-8")) or {}
+        except Exception as e:  # noqa: BLE001
+            _log(f"[venue] {sp.name} 읽기 실패 — 건너뜀: {e}")
+            return
+    cur = doc.get("venue")
+    if cur and cur != name and not force:
+        _log(f"[venue] {sp.name} 에 이미 '{cur}' — 유지 (--force 로 덮어씀)")
+        return
+    if cur == name:
+        _log(f"[venue] '{name}' 이미 기록됨 — 건너뜀")
+        return
+    doc["venue"] = name
+    doc["field_size"] = [float(v["length"]), float(v["width"])]
+    doc["field_circle_r"] = float(v.get("circle_r", 9.15))
+    doc["field_circle_auto"] = False
+    tmp = sp.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(doc, ensure_ascii=False), encoding="utf-8")
+    tmp.replace(sp)
+    _log(f"[venue] '{name}' → {sp.name} ({doc['field_size'][0]:.0f}×"
+         f"{doc['field_size'][1]:.0f}m, 서클R {doc['field_circle_r']}m)")
+
+
 def process_pair(pair, out_dir: Path, lens, lens_name, args) -> Path:
     left_chain, right_chain, cost = pair
     pano = out_dir / f"{_pair_name(left_chain)}.mp4"
@@ -675,6 +725,8 @@ def process_pair(pair, out_dir: Path, lens, lens_name, args) -> Path:
     else:
         with tm.stage("stitch"):
             _stitch(pair, pano, lens, lens_name, args)
+    if getattr(args, "venue", None):
+        _seed_venue(pano, args.venue, force=args.force)
     ana = pano.with_suffix(".analysis.json")
     cache = None
     if ana.exists() and not args.force and not args.reanalyze:
@@ -763,11 +815,35 @@ def main(argv=None) -> int:
                          "대역상관으로 시계를 맞춰 <pano>.match.json 자동 "
                          "생성 (PitchWatch '경기 열기'로 로드). 매칭 부족한 "
                          "영상(옆 구장 등)은 자동 제외")
+    ap.add_argument("--venue", default=None, metavar="이름",
+                    help="경기장 프리셋 이름 (presets/venues.json) — 규격을 "
+                         "<pano>.ptz.json 에 미리 기록해 PitchWatch 가 열 때 "
+                         "바로 쓰게 한다. 이름 목록은 --list-venues")
+    ap.add_argument("--list-venues", action="store_true",
+                    help="등록된 경기장 프리셋을 출력하고 종료")
     ap.add_argument("--far-augment", action="store_true",
                     help="기존 분석에 원경 네이티브 타일 '사람' 검출만 추가 "
                          "(tid 800001+). 기존 트랙릿·수동 편집 보존 — 편집한 "
                          "영상의 저렴한 대안 (재실행 안전: 이미 보강했으면 스킵)")
+    # --list-venues 는 좌/우 디렉터리 없이도 동작해야 한다 (조회 전용)
+    if "--list-venues" in list(sys.argv[1:] if argv is None else argv):
+        venues = load_venues()
+        if not venues:
+            print(f"등록된 경기장 없음 ({_venues_path()})")
+            return 1
+        for nm, v in sorted(venues.items()):
+            print(f"{nm}: {v['length']:.0f}×{v['width']:.0f}m, "
+                  f"서클R {v.get('circle_r', 9.15)}m")
+        return 0
     args = ap.parse_args(argv)
+
+    # 경기장 이름 오타는 여기서 잡는다 — 수 시간 뒤에 알면 늦다
+    if args.venue:
+        venues = load_venues()
+        if args.venue not in venues:
+            print(f"경기장 프리셋 없음: {args.venue}\n"
+                  f"사용 가능: {', '.join(sorted(venues)) or '(없음)'}")
+            return 1
 
     profiles = builtin_profiles()
     if args.lens not in profiles:
