@@ -19,6 +19,8 @@ CUDA Toolkit 전체 설치는 불필요했다 — torch 가 끌고 온 pip nvidi
 (CUDA 13.0)이 13.1 빌드를 마이너 버전 호환으로 받아준다.
 
 사용: python scripts/gpu_pipeline_probe.py [프레임수] [scale]
+
+GoPro 챕터의 디먹서 한도 문제는 gpu_chapters 가 import 시 처리한다.
 """
 import json
 import os
@@ -30,10 +32,12 @@ import cv2
 import numpy as np
 
 sys.path.insert(0, "/mnt/d/projects/TouchlineAnalyst")
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 from pystitch.core.chapters import ChapteredVideo
 from pystitch.core.lens import LensProfile, builtin_profiles
 from pystitch.core.project import alignment_from_dict
 from pystitch.core.render import Renderer, seam_weights
+from gpu_chapters import ChapteredGpuReader
 
 SP = Path("/tmp/claude-1000/-mnt-d-projects-TouchlineAnalyst/"
           "ad7a4742-c0fc-4da7-a82f-d2c899b4dcca/scratchpad")
@@ -78,6 +82,9 @@ f_l = int(round(t_start * fps_src))
 f_r = int(round((t_start + offset) * fps_src))
 
 # ---------------------------------------------------------------- CPU 경로
+# 긴 실행에서 CPU 경로까지 다 돌리면 비교에 쓰는 시간이 대부분이 된다 —
+# 기준선은 앞부분 표본으로 충분하다 (fps 는 프레임 수에 선형).
+N_CPU = min(N, 300)
 vl = ChapteredVideo(LF)
 vr = ChapteredVideo(RF)
 vl.seek_frame(f_l)
@@ -89,16 +96,18 @@ vl.seek_frame(f_l)
 vr.seek_frame(f_r)
 c0, w_0 = cpu_time(), time.perf_counter()
 cpu_last = None
-for i in range(N):
+n_cpu = 0
+for i in range(N_CPU):
     ok, il = vl.read()
     ok2, ir = vr.read()
     if not (ok and ok2):
         break
     cpu_last = r.render(il, ir)
+    n_cpu += 1
 cpu_w, cpu_c = time.perf_counter() - w_0, cpu_time() - c0
 vl.release()
 vr.release()
-print(f"CPU 경로   : {i+1}프레임 wall {cpu_w:6.2f}s ({(i+1)/cpu_w:5.2f} fps)  "
+print(f"CPU 경로   : {n_cpu}프레임(표본) wall {cpu_w:6.2f}s ({n_cpu/cpu_w:5.2f} fps)  "
       f"CPU {cpu_c:6.2f}s")
 
 # ---------------------------------------------------------------- GPU 경로
@@ -120,20 +129,24 @@ w_r3 = cv2.cvtColor(1.0 - wl_full, cv2.COLOR_GRAY2BGR) * gain_r[None, None, :]
 g_wl = cv2.cuda.GpuMat(); g_wl.upload(np.ascontiguousarray(w_l3, np.float32))
 g_wr = cv2.cuda.GpuMat(); g_wr.upload(np.ascontiguousarray(w_r3, np.float32))
 
-pl = cc.VideoReaderInitParams(); pl.firstFrameIdx = f_l
-pr = cc.VideoReaderInitParams(); pr.firstFrameIdx = f_r
-rl = cc.createVideoReader(LF[0], params=pl); rl.set(cc.BGR)
-rr = cc.createVideoReader(RF[0], params=pr); rr.set(cc.BGR)
+rl = ChapteredGpuReader(LF); rl.seek_frame(f_l)
+rr = ChapteredGpuReader(RF); rr.seek_frame(f_r)
+print(f"L 체인 {len(LF)}챕터 {rl.total_frames}프레임, "
+      f"R 체인 {len(RF)}챕터 {rr.total_frames}프레임")
+bounds = [b for b in rl.cum[1:-1] if f_l < b < f_l + N]
+print(f"이 구간에서 넘는 챕터 경계: {bounds or '없음'}")
 
 writer = None
 out_mp4 = str(SP / "gpu_pipeline_out.mp4")
 gpu_last = None
 c0, w_0 = cpu_time(), time.perf_counter()
 n = 0
+last_log = time.perf_counter()
 for i in range(N):
-    okl, gl = rl.nextFrame()
-    okr, gr = rr.nextFrame()
+    okl, gl = rl.read()
+    okr, gr = rr.read()
     if not (okl and okr):
+        print(f"  [{i}] 입력 종료 (L ok={okl}, R ok={okr})")
         break
     wl_ = cv2.cuda.remap(gl, g_mxl, g_myl, cv2.INTER_LINEAR)
     wr_ = cv2.cuda.remap(gr, g_mxr, g_myr, cv2.INTER_LINEAR)
@@ -146,14 +159,28 @@ for i in range(N):
         writer = cc.createVideoWriter(out_mp4, (OW, OH), cc.HEVC,
                                       fps_src, cc.BGR)
     writer.write(out8)
-    gpu_last = out8
     n += 1
+    if n == min(N_CPU, N):        # CPU 표본의 마지막과 **같은 프레임**을 잡는다
+        gpu_last = out8
+    if n % 1000 == 0:
+        now = time.perf_counter()
+        free_b, total_b = cv2.cuda.DeviceInfo(0).freeMemory(), \
+            cv2.cuda.DeviceInfo(0).totalMemory()
+        print(f"  {n:6d}프레임  최근 {1000/(now-last_log):5.2f} fps  "
+              f"누적 {n/(now-w_0):5.2f} fps  "
+              f"L챕터 {rl._chapter} 재오픈 {rl.reopens}  "
+              f"VRAM 사용 {(total_b-free_b)/2**30:.2f}GB", flush=True)
+        last_log = now
 gpu_w, gpu_c = time.perf_counter() - w_0, cpu_time() - c0
 if writer is not None:
     writer.release()
 print(f"GPU 경로   : {n}프레임 wall {gpu_w:6.2f}s ({n/gpu_w:5.2f} fps)  "
       f"CPU {gpu_c:6.2f}s   (NVENC 인코딩 포함)")
-print(f"  wall {cpu_w/max(gpu_w,1e-9):.2f}x 빠름,  CPU {cpu_c/max(gpu_c,1e-9):.1f}x 적음")
+cpu_fps = n_cpu / max(cpu_w, 1e-9)
+gpu_fps = n / max(gpu_w, 1e-9)
+# 프레임 수가 다르므로 wall 총합이 아니라 fps·프레임당 CPU 로 비교한다
+print(f"  처리량 {gpu_fps/max(cpu_fps,1e-9):.2f}x,  프레임당 CPU "
+      f"{(cpu_c/max(n_cpu,1))/max(gpu_c/max(n,1),1e-9):.1f}x 적음")
 
 # ---------------------------------------------------------------- 일치도
 if cpu_last is not None and gpu_last is not None:
