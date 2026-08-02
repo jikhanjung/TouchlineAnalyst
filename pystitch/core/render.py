@@ -28,6 +28,20 @@ from .lens import LensProfile
 from .perspective import build_perspective_maps
 
 
+def gain_lut(gain) -> np.ndarray:
+    """채널 게인 → 256엔트리 LUT (1,256,3).
+
+    `cv2.multiply(img, gain)` 는 **단일 스레드**라 render 의 최대 항목이었다
+    (5976×2306 실측: remap 두 개 합보다 2.4배 오래 걸림, devlog 098).
+    같은 연산을 LUT 로 하면 병렬화돼 5~6배 빠르고, 결과는 **비트 동일**하다
+    (게인 조합 1000건 검증 — 양쪽 다 round-half-even + 포화).
+    """
+    g = np.asarray(gain[:3], np.float64)
+    tbl = np.clip(np.rint(np.arange(256, dtype=np.float64)[:, None] * g[None, :]),
+                  0, 255)
+    return tbl.astype(np.uint8).reshape(1, 256, 3)
+
+
 def compute_gains(warped_l, warped_r, mask_l, mask_r):
     """겹침 영역 채널 평균을 기하평균으로 정렬하는 채널별 게인."""
     overlap = (mask_l > 0) & (mask_r > 0)
@@ -169,6 +183,25 @@ class Renderer:
                      else (mx, my) for mx, my in crops]
         self._crop_off = (0, self._x0)
 
+    # 게인은 대입될 때마다 LUT 를 함께 만든다 (render 는 LUT 만 쓴다).
+    @property
+    def gain_l(self):
+        return self._gain_l
+
+    @gain_l.setter
+    def gain_l(self, value):
+        self._gain_l = value
+        self._lut_l = gain_lut(value)
+
+    @property
+    def gain_r(self):
+        return self._gain_r
+
+    @gain_r.setter
+    def gain_r(self, value):
+        self._gain_r = value
+        self._lut_r = gain_lut(value)
+
     def warp(self, img, side: int):
         """크롭 영역 워핑 (L: 폭 x1, R: 폭 out_w-x0)."""
         return cv2.remap(img, *self.maps[side], interpolation=cv2.INTER_LINEAR)
@@ -185,8 +218,8 @@ class Renderer:
 
     def render(self, img_l, img_r):
         x0, x1 = self._x0, self._x1
-        warp_l = cv2.multiply(self.warp(img_l, 0), self.gain_l)   # 폭 x1
-        warp_r = cv2.multiply(self.warp(img_r, 1), self.gain_r)   # 폭 out_w-x0
+        warp_l = cv2.LUT(self.warp(img_l, 0), self._lut_l)   # 폭 x1
+        warp_r = cv2.LUT(self.warp(img_r, 1), self._lut_r)   # 폭 out_w-x0
         out = np.empty((self.out_h, self.out_w, 3), np.uint8)
         out[:, :x0] = warp_l[:, :x0]
         out[:, x1:] = warp_r[:, x1 - x0 :]
