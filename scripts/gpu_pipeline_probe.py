@@ -18,7 +18,7 @@ NVDEC → cv2.cuda.remap → GPU 블렌딩 → NVENC. CPU 경로(현행)와 처�
 CUDA Toolkit 전체 설치는 불필요했다 — torch 가 끌고 온 pip nvidia-* 런타임
 (CUDA 13.0)이 13.1 빌드를 마이너 버전 호환으로 받아준다.
 
-사용: python scripts/gpu_pipeline_probe.py [프레임수] [scale]
+사용: python scripts/gpu_pipeline_probe.py [프레임수] [scale] [프로젝트.pystitch.json]
 
 GoPro 챕터의 디먹서 한도 문제는 gpu_chapters 가 import 시 처리한다.
 """
@@ -41,7 +41,8 @@ from gpu_chapters import ChapteredGpuReader
 
 SP = Path("/tmp/claude-1000/-mnt-d-projects-TouchlineAnalyst/"
           "ad7a4742-c0fc-4da7-a82f-d2c899b4dcca/scratchpad")
-PROJ = Path("/mnt/f/Pictures/20260801_GoPro/pano_0001.pystitch.json")
+PROJ = Path(sys.argv[3] if len(sys.argv) > 3
+            else "/mnt/f/Pictures/20260801_GoPro/pano_0001.pystitch.json")
 N = int(sys.argv[1]) if len(sys.argv) > 1 else 60
 SCALE = float(sys.argv[2]) if len(sys.argv) > 2 else 1.0
 cc = cv2.cudacodec
