@@ -21,12 +21,22 @@ import numpy as np
 
 
 def build_perspective_maps(w: int, h: int, horizon: float,
-                           k: float = 0.3, m: float = 1.3):
-    """출력→소스 remap 맵 (map_x, map_y) 생성. k=0, m=1이면 항등."""
+                           k: float = 0.3, m: float = 1.3,
+                           src_w: int | None = None):
+    """출력→소스 remap 맵 (map_x, map_y) 생성. k=0, m=1이면 항등.
+
+    src_w 를 주면 출력 폭(w)과 소스 폭(src_w)을 분리한다. 키스톤은 상단
+    행의 가로 배율이 1/m 이라 출력이 소스와 같은 폭이면 상단 좌우가
+    (1-1/m) 만큼 잘린다 — w = src_w*m 으로 넓히면 상단이 온전히 남고,
+    대신 하단 좌우에 빈 쐐기가 생긴다 (행마다 가로 배율이 다르므로
+    직사각형 출력에서 둘 다 만족하는 폭은 없다). 소스 범위를 벗어나는
+    좌표는 음수로 나가므로 remap 의 borderValue 가 채운다.
+    """
     if not 0.0 <= k < 1.0:
         raise ValueError(f"k는 [0,1) 범위여야 함: {k}")
     if m < 1.0:
         raise ValueError(f"m은 1 이상이어야 함: {m}")
+    src_w = w if src_w is None else int(src_w)
 
     yb = h - 1.0  # 최하단 행 (고정점)
     yo = np.arange(h, dtype=np.float64)
@@ -43,9 +53,10 @@ def build_perspective_maps(w: int, h: int, horizon: float,
     u = (y_mid[below] - horizon) / (yb - horizon)
     ys[below] = horizon + (yb - horizon) * ((1.0 - k) * u + k * u * u)
 
-    cx = (w - 1) / 2.0
+    cx_out = (w - 1) / 2.0
+    cx_src = (src_w - 1) / 2.0
     xo = np.arange(w, dtype=np.float64)
-    map_x = ((xo[None, :] - cx) * ws[:, None] + cx).astype(np.float32)
+    map_x = ((xo[None, :] - cx_out) * ws[:, None] + cx_src).astype(np.float32)
     map_y = np.repeat(ys[:, None], w, axis=1).astype(np.float32)
     return map_x, map_y
 

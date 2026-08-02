@@ -41,7 +41,8 @@ def export_pano(lens, segments, left_files, right_files, offset_sec,
                 start_sec, end_sec, out_path,
                 pitch_user=0.0, roll_user=0.0, yaw_user=0.0,
                 codec="libx264", crf=19, scale=1.0, feather_px=40,
-                ptz=False, persp_k=0.0, persp_m=1.0, el0=None, el1=None,
+                ptz=False, persp_k=0.0, persp_m=1.0, persp_widen=1.0,
+                el0=None, el1=None,
                 progress=None, log=print, cancel=None, gop_sec=2.0) -> str:
     """좌/우 챕터 체인을 정합 세그먼트로 스티칭해 파노라마 영상 인코딩.
 
@@ -110,7 +111,8 @@ def export_pano(lens, segments, left_files, right_files, offset_sec,
         e1 = el1 if el1 is not None else alignment.el1
         r = Renderer(lens, R_wl, R_wr, yaw_c - half_range, yaw_c + half_range,
                      e0, e1, scale=scale, feather_px=feather_px,
-                     persp_k=persp_k, persp_m=persp_m)
+                     persp_k=persp_k, persp_m=persp_m,
+                     persp_widen=persp_widen)
         r.set_gains_from(*cands[0])
         for cal_l, cal_r in cands:
             if r.refine_seam(cal_l, cal_r, log=log) > 0:

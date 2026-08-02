@@ -79,31 +79,44 @@ class Renderer:
     """
 
     def __init__(self, lens: LensProfile, R_wl, R_wr, yaw0, yaw1, el0, el1,
-                 scale=1.0, feather_px=40, persp_k=0.0, persp_m=1.0):
+                 scale=1.0, feather_px=40, persp_k=0.0, persp_m=1.0,
+                 persp_widen=1.0):
         self.lens = lens
         f = lens.focal * scale
         self.scale = scale
-        self.out_w = int((yaw1 - yaw0) * f) & ~1
+        cyl_w = int((yaw1 - yaw0) * f) & ~1
         self.out_h = int((np.tan(el1) - np.tan(el0)) * f) & ~1
         self.el0, self.el1 = el0, el1
         self.persp_k, self.persp_m = persp_k, persp_m
+        if persp_widen < 1.0:
+            raise ValueError(f"persp_widen 은 1 이상이어야 함: {persp_widen}")
+        if persp_widen > 1.0 and persp_m <= 1.0:
+            # 키스톤 없이 넓히면 좌우에 검은 띠만 붙는다 — 설정 실수를 즉시 알린다
+            raise ValueError("persp_widen 은 persp_m > 1 일 때만 의미가 있음 "
+                             f"(m={persp_m}, widen={persp_widen})")
+        self.persp_widen = persp_widen
         persp = None
         if persp_k > 0.0 or persp_m > 1.0:
             # elevation=0 행: t = linspace(tan(el1), tan(el0)) 이 0이 되는 위치
             t1, t0 = np.tan(el1), np.tan(el0)
             horizon = (self.out_h - 1) * t1 / (t1 - t0)
+            self.out_w = int(cyl_w * persp_widen) & ~1
             persp = build_perspective_maps(self.out_w, self.out_h, horizon,
-                                           persp_k, persp_m)
+                                           persp_k, persp_m, src_w=cyl_w)
+        else:
+            self.out_w = cyl_w
         self._float_maps, masks = [], []
         src_ones = np.ones((lens.height, lens.width), np.uint8) * 255
         for R_cam in (R_wl, R_wr):
-            mx, my = build_cylindrical_maps(lens, R_cam, self.out_w, self.out_h,
+            mx, my = build_cylindrical_maps(lens, R_cam, cyl_w, self.out_h,
                                             yaw0, yaw1, el0, el1)
             if persp is not None:
+                # 넓힌 캔버스의 빈 쐐기는 소스 밖을 가리켜야 한다 — REPLICATE
+                # 로 두면 가장자리 화소가 쐐기로 번진다 (widen>1 에서만 발생).
                 mx = cv2.remap(mx, persp[0], persp[1], cv2.INTER_LINEAR,
-                               borderMode=cv2.BORDER_REPLICATE)
+                               borderMode=cv2.BORDER_CONSTANT, borderValue=-1)
                 my = cv2.remap(my, persp[0], persp[1], cv2.INTER_LINEAR,
-                               borderMode=cv2.BORDER_REPLICATE)
+                               borderMode=cv2.BORDER_CONSTANT, borderValue=-1)
             self._float_maps.append((mx, my))
             masks.append(cv2.remap(src_ones, mx, my, cv2.INTER_NEAREST, borderValue=0))
         self._masks = masks

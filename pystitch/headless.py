@@ -370,24 +370,31 @@ def _stitch(pair, pano: Path, lens, lens_name, args):
         "offset_sec": offset,
         "lens_profile": lens_name,
         "segments": segments,
+        # 투영 파라미터를 사이드카에 남긴다 — 파노라마 픽셀 좌표계가 이 값에
+        # 달려 있어, 나중에 field 캘리브/랜드마크를 해석하려면 필요하다.
         "user": {"pitch": 0.0, "roll": 0.0, "yaw": 0.0,
                  "feather_px": args.feather,
                  "el_top_deg": round(float(np.rad2deg(el1)), 2),
-                 "el_bottom_deg": round(float(np.rad2deg(el0)), 2)},
+                 "el_bottom_deg": round(float(np.rad2deg(el0)), 2),
+                 "persp_k": args.persp_k,
+                 "persp_m": args.persp_m,
+                 "persp_widen": args.persp_widen},
     })
 
     _level_preview(pano, lens, segments, left_chain, right_chain,
-                   offset, t0, el0, el1)
+                   offset, t0, el0, el1, args)
     export_pano(lens, segments, [str(p) for p in left_chain],
                 [str(p) for p in right_chain], offset, t0, t1, str(pano),
                 codec=args.codec, crf=args.crf, feather_px=args.feather,
+                persp_k=args.persp_k, persp_m=args.persp_m,
+                persp_widen=args.persp_widen,
                 el0=el0, el1=el1, gop_sec=args.gop_sec, log=_log)
     if not args.no_proxy:
         _make_scrub_proxy(pano)
 
 
 def _level_preview(pano: Path, lens, segments, left_chain, right_chain,
-                   offset, t0, el0, el1):
+                   offset, t0, el0, el1, args=None):
     """스티칭 **시작 전** 수평 확인 프리뷰 1장 (<pano>.preview.jpg).
 
     auto-level 이 발산해 엉뚱한 pitch/roll 을 채택해도 몇 시간 인코드가
@@ -411,9 +418,14 @@ def _level_preview(pano: Path, lens, segments, left_chain, right_chain,
             raise RuntimeError("프리뷰 프레임 읽기 실패")
         w0, w1 = a.window(0.0)
         half = (w1 - w0) / 2
+        # 프리뷰는 실제 인코드와 같은 투영이어야 한다 — 여기서 눈으로 보고
+        # 중단 여부를 판단하므로 k/m 이 반영 안 되면 확인 의미가 없다.
         r = Renderer(lens, *a.rotations(0.0, 0.0),
                      a.yaw_auto - half, a.yaw_auto + half,
-                     el0, el1, scale=0.3, feather_px=12)
+                     el0, el1, scale=0.3, feather_px=12,
+                     persp_k=getattr(args, "persp_k", 0.0),
+                     persp_m=getattr(args, "persp_m", 1.0),
+                     persp_widen=getattr(args, "persp_widen", 1.0))
         r.set_gains_from(img_l, img_r)
         prev = pano.with_suffix(".preview.jpg")
         cv2.imwrite(str(prev), r.render(img_l, img_r),
@@ -808,6 +820,20 @@ def main(argv=None) -> int:
     ap.add_argument("--min-votes", type=int, default=3)
     ap.add_argument("--cpu", action="store_true", help="OCR 에서 GPU 미사용")
     ap.add_argument("--no-ocr", action="store_true")
+    ap.add_argument("--persp-k", type=float, default=0.0, metavar="K",
+                    help="원근비 조절 — 세로 리맵 강도 [0,1). 수평선 부근을 "
+                         "1/(1-K) 배 확대하고 최하단을 (1+K) 배 압축한다. "
+                         "가로는 안 건드려 모서리 손실이 없지만, 원경 선수가 "
+                         "세로로만 늘어난다 (0=없음, 실측 권장 0.3)")
+    ap.add_argument("--persp-m", type=float, default=1.0, metavar="M",
+                    help="원근비 조절 — 키스톤 최상단 배율 (1=없음). 행마다 "
+                         "가로·세로를 함께 확대해 종횡비는 지키지만, 캔버스를 "
+                         "안 넓히면 상단 좌우가 (1-1/M) 만큼 잘린다 "
+                         "(실측 권장 1.3 + --persp-widen 1.15)")
+    ap.add_argument("--persp-widen", type=float, default=1.0, metavar="배율",
+                    help="키스톤 출력 캔버스 확장 배율 (1=현재 동작). M 과 "
+                         "같게 주면 상단이 온전히 남고 하단 좌우에 빈 쐐기가 "
+                         "생긴다. 1.15 가 절충점. --persp-m > 1 일 때만 유효")
     ap.add_argument("--stitch-only", action="store_true",
                     help="스티칭까지만 하고 분석·호각·매치·OCR 생략 — "
                          "파노라마만 먼저 뽑을 때. 나중에 이 플래그를 빼고 "
@@ -853,6 +879,22 @@ def main(argv=None) -> int:
             print(f"경기장 프리셋 없음: {args.venue}\n"
                   f"사용 가능: {', '.join(sorted(venues)) or '(없음)'}")
             return 1
+
+    # 원근 파라미터도 여기서 잡는다 — 경기장 이름과 같은 이유로, 몇 시간
+    # 인코드한 뒤 Renderer 에서 터지면 늦다.
+    if not 0.0 <= args.persp_k < 1.0:
+        print(f"--persp-k 는 [0,1) 범위여야 함: {args.persp_k}")
+        return 1
+    if args.persp_m < 1.0:
+        print(f"--persp-m 은 1 이상이어야 함: {args.persp_m}")
+        return 1
+    if args.persp_widen < 1.0:
+        print(f"--persp-widen 은 1 이상이어야 함: {args.persp_widen}")
+        return 1
+    if args.persp_widen > 1.0 and args.persp_m <= 1.0:
+        print("--persp-widen 은 --persp-m > 1 일 때만 의미가 있음 "
+              f"(m={args.persp_m}, widen={args.persp_widen})")
+        return 1
 
     profiles = builtin_profiles()
     if args.lens not in profiles:
