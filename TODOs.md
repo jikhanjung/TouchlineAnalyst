@@ -52,10 +52,13 @@
   출력 버퍼라 스레드 안전. 유휴 4코어 활용해 1.4~1.7배 기대. 반나절.
 - **스티칭·분석 겹쳐 돌리기** — 자원이 거의 안 겹친다(스티칭 중 GPU 컴퓨트
   6%, 분석 중 NVENC 0%). 코드 수정 0.
-- **NVDEC 은 보류** — 이 OpenCV(5.0.0)는 CUDA 없이 빌드돼 프로세스 내 경로가
-  없다(`cuda` 디바이스 0, `cudacodec` 없음, PyAV 미설치). ffmpeg 서브프로세스
-  우회는 입력 파이프 866MB/s 를 새로 만들어 아끼는 ~1코어보다 손해일 수 있고,
-  `ChapteredVideo` 랜덤 시크(분석·OCR·GUI 의존)를 잃는다.
+- **NVDEC 보류 해제** (devlog 093) — CUDA 빌드 OpenCV(cudawarped 4.13.0.90)로
+  뚫었다. cudacodec 이 CPU 디코더와 **비트정확**하고 `firstFrameIdx` 시크도
+  프레임 정확(231~318ms). GPU 상주 프로토타입(`scripts/gpu_pipeline_probe.py`)
+  이 **wall 2.29배·CPU 7.1배 절감**, 그것도 NVENC 인코딩까지 포함하고. 9p 도
+  병목이 아니었다(120MB/s vs 필요량 7.5MB/s). 남은 것: 색변환(BT.709 풀레인지
+  자체 변환), 챕터 경계, Windows 적용(CUDA Toolkit 13.1 필요), `render.py`
+  GPU 경로 + 폴백. 4.13 다운그레이드는 검증됨(182건 통과, 렌더 PSNR 48.7dB).
 
 ---
 
