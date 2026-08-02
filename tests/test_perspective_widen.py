@@ -91,3 +91,36 @@ def test_renderer_widen_changes_out_w_only():
     wide = Renderer(lens, R, R, -0.4, 0.4, -0.6, 0.15, persp_widen=M, **kw)
     assert wide.out_h == base.out_h
     assert wide.out_w == pytest.approx(base.out_w * M, rel=0.02)
+
+
+def test_map_type_paths_agree():
+    """CV_16SC2 맵과 float32 맵이 사실상 같은 출력을 내야 한다.
+
+    Windows 빌드에서 float32 가 1.54배 빨라 플랫폼별로 다른 경로를 쓴다
+    (devlog 097). 두 경로가 갈라지면 OS 마다 다른 파노라마가 나온다.
+    고정소수점은 좌표를 1/32 px 로 양자화하므로 완전 일치는 아니다.
+    """
+    import cv2
+    from pystitch.core import render as R
+    from pystitch.core.lens import LensProfile, builtin_profiles
+    lens = LensProfile.load(builtin_profiles()["GoPro_HERO5_Black_Wide_4K_16x9"])
+    rot = np.eye(3)
+    kw = dict(scale=0.06, feather_px=8)
+    rng = np.random.default_rng(3)
+    img = rng.integers(0, 255, (lens.height, lens.width, 3), dtype=np.uint8)
+
+    outs = {}
+    for fixed in (True, False):
+        old = R.USE_FIXED_MAPS
+        R.USE_FIXED_MAPS = fixed
+        try:
+            r = R.Renderer(lens, rot, rot, -0.4, 0.4, -0.6, 0.15, **kw)
+            outs[fixed] = r.render(img, img)
+        finally:
+            R.USE_FIXED_MAPS = old
+
+    a, b = outs[True].astype(np.float64), outs[False].astype(np.float64)
+    assert a.shape == b.shape
+    mse = ((a - b) ** 2).mean()
+    psnr = float("inf") if mse == 0 else 10 * np.log10(255 ** 2 / mse)
+    assert psnr > 35, f"두 맵 경로가 갈라짐 (PSNR {psnr:.1f}dB)"

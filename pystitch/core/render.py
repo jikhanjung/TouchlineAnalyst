@@ -1,8 +1,27 @@
 """파노라마 렌더링: remap 캐싱, 게인 보정, 심/페더 블렌딩."""
 from __future__ import annotations
 
+import os
+import sys
+
 import cv2
 import numpy as np
+
+# remap 맵을 CV_16SC2(고정소수점)로 둘지 float32 로 둘지.
+#
+# 통념은 고정소수점이 빠르다는 것이고 Linux 빌드에선 실제로 2% 빠르다.
+# 그런데 **Windows 용 opencv-python 휠에서는 정반대로 1.54배 느리다**
+# (5976×2306 실측: float32 15.1ms vs CV_16SC2 23.2ms, devlog 097).
+# 같은 5.0.0 이지만 GCC/pthreads 빌드와 MSVC/ConcRT 빌드의 차이다.
+# 실제 렌더로도 Windows 에서 +11% / CPU −20%.
+#
+# 정확도는 float32 쪽이 낫다 — 고정소수점은 좌표를 1/32 픽셀로 양자화한다
+# (두 경로 출력 차이 PSNR 59.7dB, 최대차 4).
+#
+# 다른 OpenCV 빌드(4.13 PyPI, conda-forge)도 재봤지만 현행 5.0.0 +
+# float32 조합을 못 이겼다. PYSTITCH_FIXED_MAPS=1/0 으로 강제 가능.
+_env = os.environ.get("PYSTITCH_FIXED_MAPS")
+USE_FIXED_MAPS = (_env == "1") if _env is not None else sys.platform != "win32"
 
 from .geometry import build_cylindrical_maps
 from .lens import LensProfile
@@ -140,12 +159,14 @@ class Renderer:
     def _rebuild_cropped_maps(self):
         """분할 렌더용 크롭 맵: L 은 [0, x1), R 은 [x0, out_w)."""
         (mxl, myl), (mxr, myr) = self._float_maps
-        self.maps = [
-            cv2.convertMaps(np.ascontiguousarray(mxl[:, : self._x1]),
-                            np.ascontiguousarray(myl[:, : self._x1]), cv2.CV_16SC2),
-            cv2.convertMaps(np.ascontiguousarray(mxr[:, self._x0 :]),
-                            np.ascontiguousarray(myr[:, self._x0 :]), cv2.CV_16SC2),
+        crops = [
+            (np.ascontiguousarray(mxl[:, : self._x1]),
+             np.ascontiguousarray(myl[:, : self._x1])),
+            (np.ascontiguousarray(mxr[:, self._x0 :]),
+             np.ascontiguousarray(myr[:, self._x0 :])),
         ]
+        self.maps = [cv2.convertMaps(mx, my, cv2.CV_16SC2) if USE_FIXED_MAPS
+                     else (mx, my) for mx, my in crops]
         self._crop_off = (0, self._x0)
 
     def warp(self, img, side: int):

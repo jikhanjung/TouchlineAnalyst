@@ -31,8 +31,10 @@
   opencv-python 휠의 `cv2.remap` 이 **프레임당 CPU 를 48% 더 쓴다**
   (184ms vs 124ms, 병렬화 수준은 2.2코어로 동일). GCC/pthreads 빌드 vs
   MSVC/ConcRT 빌드 차이. render 가 임계 경로라 그대로 종단 차이가 된다.
-  → Windows 를 계속 쓸 거면 **다른 OpenCV 빌드**(conda-forge, CUDA 휠)를
-  같은 벤치로 재볼 것.
+  → 다른 OpenCV 빌드(4.13 PyPI, conda-forge)는 **전부 열세**라 답이
+  아니었다. 대신 **맵 타입**이 범인이었다 — devlog 097 에서 Windows 를
+  float32 맵으로 바꿔 렌더 +11%/CPU −20%. 그래도 WSL 대비 26% 느린 건
+  남는다(MSVC 코드젠 추정, 더 파려면 OpenCV 직접 빌드 필요).
 
 ### 2. 분석 2병렬 가능 여부 측정 (30분)
 
