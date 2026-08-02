@@ -182,6 +182,14 @@ class Renderer:
         self.maps = [cv2.convertMaps(mx, my, cv2.CV_16SC2) if USE_FIXED_MAPS
                      else (mx, my) for mx, my in crops]
         self._crop_off = (0, self._x0)
+        # 워프 결과를 담을 상주 버퍼. 프레임마다 새로 할당하면 41MB+ 의
+        # **페이지 폴트가 첫 쓰기 단계에 얹혀** render 의 30% 를 먹는다
+        # (devlog 100 실측: 복사 L 이 개별 측정 2.2ms → 문맥 내 11.3ms).
+        # 상주시키면 그 비용이 사라진다. 외부로 반환되지 않으므로 안전하다.
+        self._warp_buf = [
+            np.empty((self.out_h, self._x1, 3), np.uint8),
+            np.empty((self.out_h, self.out_w - self._x0, 3), np.uint8),
+        ]
 
     # 게인은 대입될 때마다 LUT 를 함께 만든다 (render 는 LUT 만 쓴다).
     @property
@@ -202,9 +210,14 @@ class Renderer:
         self._gain_r = value
         self._lut_r = gain_lut(value)
 
-    def warp(self, img, side: int):
-        """크롭 영역 워핑 (L: 폭 x1, R: 폭 out_w-x0)."""
-        return cv2.remap(img, *self.maps[side], interpolation=cv2.INTER_LINEAR)
+    def warp(self, img, side: int, dst=None):
+        """크롭 영역 워핑 (L: 폭 x1, R: 폭 out_w-x0).
+
+        dst 를 주면 그 버퍼에 직접 쓴다 (render 의 상주 버퍼용). 생략하면
+        새 배열을 만들어 반환한다 — 외부 호출자는 이쪽을 쓴다.
+        """
+        return cv2.remap(img, *self.maps[side], interpolation=cv2.INTER_LINEAR,
+                         dst=dst)
 
     def set_gains_from(self, img_l, img_r):
         """심 밴드 영역에서 채널 게인 추정."""
@@ -218,14 +231,17 @@ class Renderer:
 
     def render(self, img_l, img_r):
         x0, x1 = self._x0, self._x1
-        warp_l = cv2.LUT(self.warp(img_l, 0), self._lut_l)   # 폭 x1
-        warp_r = cv2.LUT(self.warp(img_r, 1), self._lut_r)   # 폭 out_w-x0
+        wl = self.warp(img_l, 0, dst=self._warp_buf[0])   # 폭 x1
+        wr = self.warp(img_r, 1, dst=self._warp_buf[1])   # 폭 out_w-x0
+        # 출력은 매번 새로 만든다 — export 는 프레임을 큐에 넣으므로 반환
+        # 버퍼를 재사용하면 앞 프레임을 덮어쓴다. LUT 을 **출력 슬라이스에
+        # 직접** 써서 중간 배열과 조립 복사를 없앤다.
         out = np.empty((self.out_h, self.out_w, 3), np.uint8)
-        out[:, :x0] = warp_l[:, :x0]
-        out[:, x1:] = warp_r[:, x1 - x0 :]
+        cv2.LUT(wl[:, :x0], self._lut_l, dst=out[:, :x0])
+        cv2.LUT(wr[:, x1 - x0 :], self._lut_r, dst=out[:, x1:])
         out[:, x0:x1] = cv2.blendLinear(
-            np.ascontiguousarray(warp_l[:, x0:x1]),
-            np.ascontiguousarray(warp_r[:, : x1 - x0]),
+            np.ascontiguousarray(cv2.LUT(wl[:, x0:x1], self._lut_l)),
+            np.ascontiguousarray(cv2.LUT(wr[:, : x1 - x0], self._lut_r)),
             self.w_l_band, self.w_r_band)
         return out
 
