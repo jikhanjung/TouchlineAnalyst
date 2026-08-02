@@ -196,6 +196,11 @@ def export_pano(lens, segments, left_files, right_files, offset_sec,
     q_out: queue.Queue = queue.Queue(maxsize=4)
 
     def reader():
+        # L·R 병렬 디코드를 시도했다가 되돌렸다 — 디코드 단독으로는 Windows
+        # 실측 42.9→35.0ms(+22.6%) 였지만 **종단은 노이즈 범위**였다
+        # (Windows +1.4%, WSL −1.6%, 편차 0.4~2.8%. devlog 101).
+        # 3단 파이프라인이 이미 디코드를 렌더와 겹치고 있고, 한계는 가장
+        # 느린 단계가 아니라 **총 CPU 예산**이라 리더만 빨라져도 소용없다.
         for _ in range(total):
             if cancelled():
                 break
