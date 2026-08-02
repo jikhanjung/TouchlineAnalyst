@@ -5,6 +5,7 @@
 """
 from __future__ import annotations
 
+import os
 import queue
 import subprocess
 import tempfile
@@ -33,7 +34,15 @@ def pipe_format(out_w: int, out_h: int) -> str:
     실측(실제 파노라마 프레임, swscale 대비): Y 최대차 1, U/V 평균 0.64,
     원본 왕복 PSNR 48.6dB vs swscale 44.5dB — 화질 손실 없음(오히려 소폭
     우수). 홀수 해상도는 4:2:0 으로 표현할 수 없어 bgr24 로 폴백한다.
+
+    `PYSTITCH_PIPE_FMT` 로 강제할 수 있다 — **측정 전용**. devlog 088 의
+    개선폭이 아직 A/B 로 확인되지 않아(088 의 17.44fps 는 I420 적용 *전*
+    다른 소재에서 잰 값이다), 같은 소재로 `bgr24` 와 비교하기 위한 것.
+    상시 사용을 의도한 옵션이 아니다.
     """
+    forced = os.environ.get("PYSTITCH_PIPE_FMT")
+    if forced:
+        return forced
     return "yuv420p" if (out_w % 2 == 0 and out_h % 2 == 0) else "bgr24"
 
 

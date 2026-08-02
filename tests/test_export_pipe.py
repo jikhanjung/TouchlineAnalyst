@@ -120,28 +120,41 @@ def test_i420_pipe_roundtrip_preserves_image(tmp_path):
 
 
 def test_i420_matches_the_bgr24_path(tmp_path):
-    """기존 경로(bgr24→swscale)와 결과가 사실상 같아야 한다."""
+    """기존 경로(bgr24→swscale)와 결과가 사실상 같아야 한다.
+
+    **루마로 판정한다.** Y 는 4:2:0 서브샘플링을 거치지 않으므로 ffmpeg
+    빌드와 무관하게 거의 일치해야 한다. 반면 색차는 빌드의 크로마 필터에
+    좌우돼 전체 PSNR 이 흔들린다 — CI 실측 Windows 39.4 / Ubuntu 39.9 로,
+    원래 걸어둔 40dB 문턱을 아슬아슬하게 밑돌아 계속 빨간불이었다
+    (실제 파노라마 프레임은 43dB). 그래서 색차는 여유 있는 하한만 본다.
+    """
     img = _smooth_frame(128, 96, seed=1)
     a = _read_frames(_pipe_through_ffmpeg(img, "yuv420p", "yuv420p",
                                           tmp_path / "a.mkv"))
     b = _read_frames(_pipe_through_ffmpeg(img, "bgr24", "bgr24",
                                           tmp_path / "b.mkv"))
     assert len(a) == len(b) == N_FRAMES
-    # 크로마 서브샘플링 필터가 달라 비트 동일하진 않다 (실측 실프레임 43dB)
-    assert _psnr(a[0], b[0]) > 40
+    y_a = cv2.cvtColor(a[0], cv2.COLOR_BGR2GRAY)
+    y_b = cv2.cvtColor(b[0], cv2.COLOR_BGR2GRAY)
+    assert _psnr(y_a, y_b) > 44, "루마가 어긋남 = 색행렬/레인지 불일치"
+    assert _psnr(a[0], b[0]) > 36, "색차까지 포함해도 두 경로는 사실상 동일"
 
 
-def test_i420_is_no_less_faithful_than_bgr24(tmp_path):
-    """바꾼 쪽이 원본에 더 가깝거나 최소한 동등해야 한다.
+def test_pipe_format_does_not_change_fidelity(tmp_path):
+    """파이프 포맷을 바꿔도 원본 충실도가 실질적으로 달라지지 않아야 한다.
 
-    실측(실제 파노라마 프레임): I420 48.6dB vs swscale 44.5dB.
+    **어느 쪽이 더 나은지는 단언하지 않는다.** devlog 088 은 실제 파노라마
+    프레임에서 I420 이 4dB 우세하다고 기록했지만(48.6 vs 44.5), Windows CI
+    의 다른 ffmpeg 빌드에서는 합성 프레임 기준 0.8dB 열세로 나온다 — 우열은
+    빌드의 크로마 필터에 달린 성질이라 불변식이 될 수 없다. 지켜야 할 것은
+    **차이가 작다**는 것뿐이다.
     """
     img = _smooth_frame(128, 96, seed=2)
     a = _read_frames(_pipe_through_ffmpeg(img, "yuv420p", "yuv420p",
                                           tmp_path / "a.mkv"))[0]
     b = _read_frames(_pipe_through_ffmpeg(img, "bgr24", "bgr24",
                                           tmp_path / "b.mkv"))[0]
-    assert _psnr(a, img) >= _psnr(b, img) - 0.5
+    assert abs(_psnr(a, img) - _psnr(b, img)) < 2.0
 
 
 def test_wrong_payload_is_detected(tmp_path):
@@ -153,3 +166,15 @@ def test_wrong_payload_is_detected(tmp_path):
     out = _pipe_through_ffmpeg(img, "yuv420p", "bgr24", tmp_path / "bad.mkv")
     frames = _read_frames(out)
     assert len(frames) != N_FRAMES or _psnr(frames[0], img) < 35
+
+
+def test_pipe_fmt_env_override(monkeypatch):
+    """PYSTITCH_PIPE_FMT 강제 (측정용) — 없으면 기존 자동 판정."""
+    monkeypatch.delenv("PYSTITCH_PIPE_FMT", raising=False)
+    assert pipe_format(6022, 2254) == "yuv420p"
+    monkeypatch.setenv("PYSTITCH_PIPE_FMT", "bgr24")
+    assert pipe_format(6022, 2254) == "bgr24"      # 짝수여도 강제가 이긴다
+    monkeypatch.setenv("PYSTITCH_PIPE_FMT", "yuv420p")
+    assert pipe_format(6023, 2254) == "yuv420p"    # 홀수 폴백보다도 강제가 우선
+    monkeypatch.delenv("PYSTITCH_PIPE_FMT")
+    assert pipe_format(6023, 2254) == "bgr24"
