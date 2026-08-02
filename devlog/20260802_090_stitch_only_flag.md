@@ -59,8 +59,57 @@ ultralytics 8.4.99, lap 0.9.4, ffmpeg 8.1.2(h264/hevc/av1 nvenc).
 `pystitch.headless` 자체는 import 통과한다. 분석까지 이어서 돌릴 때
 `pip install easyocr` 만 있으면 되고, 나머지 둘은 GUI·빌드용이다.
 
+## ⚠️ NVENC 가 죽어 있었다 — ffmpeg/드라이버 API 불일치
+
+`--venue` 확인차 돌린 실행에서 `[encode] 코덱 auto → libx264 (CPU)` 가
+떴다. 코드 문제가 아니라 환경이 뒤에서 바뀐 것:
+
+```
+[h264_nvenc] Driver does not support the required nvenc API version.
+             Required: 13.1  Found: 13.0
+             The minimum required Nvidia driver for nvenc is 610.00 or newer
+```
+
+winget 이 ffmpeg 를 **8.1.2** 로 올려놨는데 이 빌드는 nvenc API 13.1 을
+요구하고, 드라이버 591.86 은 13.0 만 준다. `nvenc_works()` 의 1프레임
+테스트 인코드(devlog 080)가 정확히 이걸 잡아 libx264 로 폴백한 것 —
+**가드는 제대로 동작했다.**
+
+| ffmpeg | 위치 | 6022px hevc_nvenc |
+|---|---|---|
+| 8.1.2 (winget) | `%LOCALAPPDATA%\...\WinGet\Links` | ❌ API 13.1 요구 |
+| **8.0.1** | **`D:\ffmpeg\bin`** | **✅** |
+| 4.2 | `D:\ffmpeg-4.2-win64-static\bin` | ❌ `unsupported param (12)` |
+| 6.1.1 (WSL) | `/usr/bin` | ✅ |
+
+이미 `D:\ffmpeg\bin` 에 8.0.1 이 있어서 **드라이버 업데이트도 다운로드도
+불필요**했다. `ffmpeg_bin()` 이 `shutil.which()` 로 PATH 를 먼저 보므로
+PATH 앞에 붙이는 것만으로 해결 (시스템 winget 설치는 안 건드림):
+
+```powershell
+$env:PATH = 'D:\ffmpeg\bin;' + $env:PATH
+```
+
+실측 확인:
+
+| | ffmpeg_bin() | nvenc_works | resolve_codec(w=6022) |
+|---|---|---|---|
+| 전 | WinGet\Links\ffmpeg.EXE | False | libx264 |
+| 후 | D:\ffmpeg\bin\ffmpeg.EXE | True | **hevc_nvenc** |
+
+`encoder_args` 실인자(`-preset p4 -rc vbr -cq 19 -b:v 0 -tag:v hvc1`)로
+6022×2254 5프레임 인코드도 통과.
+
+**주의:** 시작 로그는 `코덱 auto → h264_nvenc (GPU)` 로 뜬다.
+`resolve_codec` 이 headless 에서 width 없이 한 번만 불리기 때문인데,
+실제 인코드는 `export.py:151` 의 폭 가드가 `폭 6022px > h264 NVENC 한계
+4096 → hevc_nvenc` 로 내려준다. 정상 동작이다.
+
 ## 다음
 
 - 스티칭 실행(2건, ~2.3시간 추정) 후 **devlog 088 의 I420 파이프 개선폭
   측정** — TODOs 대기 항목. 0392 기준 17.44fps 대비 fps 와 ffmpeg CPU%.
-- 경기장 프리셋은 미정 — 확인되면 `--venue` 로 시딩하거나 GUI 에서.
+  **PATH 를 안 바꾸면 libx264 로 떨어져 측정 자체가 무의미하다.**
+- ffmpeg 를 winget 으로 다시 올리면 NVENC 가 또 죽는다 — 드라이버가
+  610+ 로 올라가기 전까지는 `D:\ffmpeg\bin` 을 앞세울 것.
+- 경기장: 양재근린공원 (`--venue` 로 시딩).
