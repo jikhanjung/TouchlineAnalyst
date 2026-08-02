@@ -727,6 +727,11 @@ def process_pair(pair, out_dir: Path, lens, lens_name, args) -> Path:
             _stitch(pair, pano, lens, lens_name, args)
     if getattr(args, "venue", None):
         _seed_venue(pano, args.venue, force=args.force)
+    # 스티칭만 — 분석은 나중에 같은 명령으로 이어붙인다 (스티칭은 산출물
+    # 게이팅에 걸려 '있음 — 건너뜀' 으로 넘어간다).
+    if getattr(args, "stitch_only", False):
+        _log("[stitch-only] 분석·호각·OCR 생략")
+        return pano
     ana = pano.with_suffix(".analysis.json")
     cache = None
     if ana.exists() and not args.force and not args.reanalyze:
@@ -803,6 +808,10 @@ def main(argv=None) -> int:
     ap.add_argument("--min-votes", type=int, default=3)
     ap.add_argument("--cpu", action="store_true", help="OCR 에서 GPU 미사용")
     ap.add_argument("--no-ocr", action="store_true")
+    ap.add_argument("--stitch-only", action="store_true",
+                    help="스티칭까지만 하고 분석·호각·매치·OCR 생략 — "
+                         "파노라마만 먼저 뽑을 때. 나중에 이 플래그를 빼고 "
+                         "같은 명령을 돌리면 스티칭은 건너뛰고 분석부터 이어감")
     ap.add_argument("--no-proxy", action="store_true",
                     help="스크럽/재생 프록시(.scrub.mp4) 생성 안 함")
     ap.add_argument("--force", action="store_true", help="기존 산출물 무시하고 재실행")
