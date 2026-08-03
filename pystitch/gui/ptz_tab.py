@@ -34,9 +34,10 @@ from ..core.field import (
     field_to_pano, fit_field_calibration, landmark_positions, pano_to_field,
 )
 from ..core.ptz import (
-    accept_ball_tracks, analyze_video, build_plan, build_radar_data,
-    classify_teams, draw_radar_panel, gapfill_analysis, gapfill_targets,
-    ground_positions, link_ball_tracks, propagate_seed, ptz_available,
+    EXTRA_TID_BASE, accept_ball_tracks, analyze_video, build_plan,
+    build_radar_data, classify_teams, draw_radar_panel, extra_tid_number,
+    gapfill_analysis, gapfill_targets, ground_positions, is_extra_tid,
+    link_ball_tracks, propagate_seed, ptz_available,
     analysis_summary, render_plan, same_spot_spans, tracklet_colors,
 )
 from .settings import app_settings
@@ -1861,7 +1862,7 @@ class PtzTab(QWidget):
         self.venue_name = None            # 이 영상의 venue 이름 (명시 선택)
         self._field_calib = None          # fit_field_calibration 결과
         self.extra_players: dict[int, list] = {}  # {샘플si: [[cx,cy,w,h,id]]}
-        self._next_extra_id = 900001      # 수동 검출 ID (분석 ID와 분리)
+        self._next_extra_id = EXTRA_TID_BASE   # 수동 검출 ID (분석 ID와 분리)
         self._adhoc = None                # 주변 재검출용 YOLO 캐시
         self._native_cap = None           # 프록시 표시 중 원본 프레임용
         self._cur_scale = 1.0             # 현재 _cur_frame 의 표시 스케일
@@ -3144,7 +3145,9 @@ class PtzTab(QWidget):
                                    doc.get("hidden_players") or []}
             ids = [int(p[4]) for rows in self.extra_players.values()
                    for p in rows]
-            self._next_extra_id = max(ids, default=900000) + 1
+            # 구 사이드카의 수동 id(900001~)가 있어도 **새 id 는 항상 새 범위**
+            # 에서 뽑는다 — 안 그러면 원경 tid 와 다시 섞인다 (devlog 103).
+            self._next_extra_id = max([*ids, EXTRA_TID_BASE - 1]) + 1
             self.field_circle_r = float(doc.get("field_circle_r",
                                                 CENTER_CIRCLE_R))
             self.field_circle_auto = bool(doc.get("field_circle_auto", True))
@@ -4155,11 +4158,11 @@ class PtzTab(QWidget):
             # 프레임 자세로 발밑을 지면 투영해 피치 밖을 거른다.
             if rc_pose is not None and self.check_infield.isChecked() and prow:
                 from ..core.rotcam import pixel_to_field
-                # 수동 검출(tid>=900000)은 면제 — 사용자가 직접 추가한
-                # 사람을 자동 장외 필터가 숨기면 추적 확장 결과가 사라져
-                # 보인다 (경기장 밖 인물 추적 용례).
+                # 수동 검출은 면제 — 사용자가 직접 추가한 사람을 자동
+                # 장외 필터가 숨기면 추적 확장 결과가 사라져 보인다
+                # (경기장 밖 인물 추적 용례).
                 ok_rows = [pp for pp in prow if len(pp) >= 4
-                           and not (len(pp) >= 5 and pp[4] >= 900000)]
+                           and not (len(pp) >= 5 and is_extra_tid(pp[4]))]
                 if ok_rows:
                     fxy = pixel_to_field(
                         rc_pose["K"], rc_pose["R"], rc_cam,
@@ -4614,7 +4617,7 @@ class PtzTab(QWidget):
             # 오인식 무시 (최상위, 직접)
             menu.addAction("오인식 무시 — 이 사람 숨기기 (선수/심판 아님)",
                            lambda _=False, t=tid: self._hide_player(t))
-            if tid >= 900001:
+            if is_extra_tid(tid):
                 menu.addSeparator()
                 row = next((p for si_ in self.extra_players
                             for p in self.extra_players[si_]
@@ -7937,7 +7940,7 @@ class PtzTab(QWidget):
             self._pcache_id = None
             self._refresh_player_list()
             self._redraw()
-            self.log(f"[seed] 선수 #{tid - 900000} {np_}샘플로 확장")
+            self.log(f"[seed] 선수 #{extra_tid_number(tid)} {np_}샘플로 확장")
 
     def _delete_extra(self, tid):
         for si, rows in list(self.extra_players.items()):

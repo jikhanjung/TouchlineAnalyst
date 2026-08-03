@@ -1,5 +1,8 @@
 """_FarTracker (원경 타일 검출 미니 트래커) — devlog 077/078."""
-from pystitch.core.ptz import _FarTracker
+from pystitch.core.ptz import (  # noqa: E402
+    FAR_TID_BASE, FAR_TID_MAX, is_extra_tid, is_far_tid,
+    _FarTracker,
+)
 
 
 def test_stable_ids_for_slow_motion():
@@ -43,4 +46,6 @@ def test_greedy_no_double_assign():
 def test_ids_in_far_range():
     trk = _FarTracker(radius=50, max_miss=5)
     (i0,) = trk.update([[100, 600, 0.9, 30, 60]], 0)
-    assert 800001 <= i0 < 900000          # ByteTrack/수동(900000+)과 분리
+    # 범위를 하드코딩하지 않는다 — 상수/판별식이 단일 출처 (devlog 103)
+    assert FAR_TID_BASE <= i0 <= FAR_TID_MAX
+    assert is_far_tid(i0) and not is_extra_tid(i0)

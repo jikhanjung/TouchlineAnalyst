@@ -561,7 +561,7 @@ def _build_match(pano: Path, args):
 
 
 def _far_augment(pano: Path, args):
-    """기존 분석에 원경 타일 사람 검출만 추가 (tid 800001+, 편집 보존)."""
+    """기존 분석에 원경 타일 사람 검출만 추가 (원경 tid, 편집 보존)."""
     from .core.ptz import analysis_summary, augment_far_persons
     out = pano.with_suffix(".analysis.json")
     d = json.loads(out.read_text())
@@ -858,7 +858,7 @@ def main(argv=None) -> int:
                     help="등록된 경기장 프리셋을 출력하고 종료")
     ap.add_argument("--far-augment", action="store_true",
                     help="기존 분석에 원경 네이티브 타일 '사람' 검출만 추가 "
-                         "(tid 800001+). 기존 트랙릿·수동 편집 보존 — 편집한 "
+                         "(원경 tid 범위). 기존 트랙릿·수동 편집 보존 — 편집한 "
                          "영상의 저렴한 대안 (재실행 안전: 이미 보강했으면 스킵)")
     # --list-venues 는 좌/우 디렉터리 없이도 동작해야 한다 (조회 전용)
     if "--list-venues" in list(sys.argv[1:] if argv is None else argv):

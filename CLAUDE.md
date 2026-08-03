@@ -43,7 +43,10 @@ tid 로 연결), `.analysis.json`(검출 원본) + `.analysis.cache.json`(요약
 `.scrub.mp4`(프록시), `.whistle.json`, `.events.json`, `.match.json`(멀티캠).
 
 **tid 네임스페이스:** ByteTrack 소형 정수 / 원경 타일 `_FarTracker`
-800001+ / 수동 검출(extra) 900001+. 전체 재분석은 tid 를 갈아치워
+8000001~8999999 / 수동 검출(extra) 9000001+. **판별은 반드시
+`core/ptz.py` 의 `is_far_tid`/`is_extra_tid` 로** (구 사이드카는 각각
+800001~900000, 900001~999999 를 쓴다). 원경 범위 소진 시 검출을 버리고
+로그를 남긴다 — 넘치면 수동 편집을 덮어쓴다 (devlog 103). 전체 재분석은 tid 를 갈아치워
 `.ptz.json` 편집을 고아로 만든다 — 편집된 영상은 `--far-augment` 사용.
 
 ## 개발 명령어

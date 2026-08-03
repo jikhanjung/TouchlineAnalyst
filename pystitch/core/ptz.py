@@ -145,24 +145,69 @@ def detect_raw(model, frame, det_w=2944, conf=0.2):
     return np.array(out) if out else np.zeros((0, 6))
 
 
+# ---------------------------------------------------------------- tid 네임스페이스
+#
+# 원경 _FarTracker 가 800001 에서 시작해 **상한 없이** 증가하던 탓에,
+# 0392(5.6시간)에서 129,952개를 만들며 수동 검출 영역(900001+)을 침범했다
+# (실측: 800001~900000 가득 + 900001~929952 구멍 없이 연속. devlog 103).
+# GUI 는 tid>=900000 을 수동으로 보고 품질 필터에서 면제하므로, 파편화된
+# 원경 트랙 3만 개가 "선수 #1~#29952" 로 둔갑했다.
+#
+# 각 구간을 10배로 넓히고, 소진 시 **조용히 넘치지 않도록** 가드를 둔다.
+FAR_TID_BASE = 8_000_001         # 원경 타일 검출
+FAR_TID_MAX = 8_999_999          # 100만 개 (0392 실측 사용량의 7.7배)
+EXTRA_TID_BASE = 9_000_001       # 수동 검출 (GUI)
+
+# 구 사이드카 호환 — 확대 전 규약 (far 800001~900000, 수동 900001~999999).
+# 그 경계에서 위 오버플로가 일어났으므로 **구 파일의 900001~929952 는
+# 사실 원경 트랙**이지만, 구분할 방법이 없어 수동으로 읽는다(기존 동작 유지).
+_LEGACY_FAR = (800_001, 900_000)
+_LEGACY_EXTRA = (900_001, 999_999)
+
+
+def is_far_tid(tid) -> bool:
+    """원경 _FarTracker 가 붙인 tid 인가 (구 사이드카 포함)."""
+    t = int(tid)
+    return (FAR_TID_BASE <= t <= FAR_TID_MAX
+            or _LEGACY_FAR[0] <= t <= _LEGACY_FAR[1])
+
+
+def is_extra_tid(tid) -> bool:
+    """사용자가 직접 추가한 검출인가 (구 사이드카 포함)."""
+    t = int(tid)
+    return t >= EXTRA_TID_BASE or _LEGACY_EXTRA[0] <= t <= _LEGACY_EXTRA[1]
+
+
+def extra_tid_number(tid) -> int:
+    """수동 검출의 표시 번호 (선수 #N)."""
+    t = int(tid)
+    return t - (EXTRA_TID_BASE - 1 if t >= EXTRA_TID_BASE
+                else _LEGACY_EXTRA[0] - 1)
+
+
 class _FarTracker:
     """원경 타일 검출용 미니 트래커 — 최근접 연결.
 
     ByteTrack 은 메인 패스(model.track) 내부에 묶여 있어 타일 검출을
     받을 수 없다. 원경 선수는 샘플 간 이동이 작아(0.1s 에 ~10px)
-    최근접 연결로 충분 — 타일 검출에 안정적 tid(800001+, ByteTrack
-    소형 정수·수동 900000+ 와 분리)를 붙여 **트랙릿/팀분류에 참여**
+    최근접 연결로 충분 — 타일 검출에 안정적 tid(FAR_TID_BASE+, ByteTrack
+    소형 정수·수동 EXTRA_TID_BASE+ 와 분리)를 붙여 **트랙릿/팀분류에 참여**
     시킨다 (사용자 방향). conf 내림차순 그리디, max_miss 샘플 놓치면
     트랙 종료."""
 
-    def __init__(self, radius, max_miss):
+    def __init__(self, radius, max_miss, log=None):
         self.tracks: dict[int, tuple] = {}   # tid → (x, y, 마지막 샘플)
-        self.next_id = 800001
+        self.next_id = FAR_TID_BASE
         self.r2 = float(radius) ** 2
         self.max_miss = max_miss
+        self._log = log
+        self.exhausted = 0                   # 범위 소진으로 버린 검출 수
 
     def update(self, dets, si):
-        """dets: [[x, y, conf, w, h], ...] (conf 내림차순) → [tid, ...]"""
+        """dets: [[x, y, conf, w, h], ...] (conf 내림차순) → [tid, ...].
+
+        tid 범위가 소진되면 해당 검출 자리에 None 을 넣는다 — 호출부는
+        건너뛴다 (수동 네임스페이스 침범 방지)."""
         # 만료 트랙은 매칭 **전에** 정리 — 뒤에 하면 오래 사라진 트랙이
         # 같은 자리 새 사람에게 재사용된다 (테스트가 잡은 버그)
         for t in [t for t, (_x, _y, last) in self.tracks.items()
@@ -178,6 +223,16 @@ class _FarTracker:
                 if dd < bd:
                     best, bd = t, dd
             if best is None:
+                if self.next_id > FAR_TID_MAX:
+                    # 범위 소진 — 넘치면 수동 검출 tid 를 덮어써 사용자
+                    # 편집이 엉뚱한 트랙에 붙는다. 검출을 버리는 쪽이 낫다.
+                    if not self.exhausted and self._log:
+                        self._log(f"[far] tid 범위 소진 ({FAR_TID_BASE}~"
+                                  f"{FAR_TID_MAX}) — 이후 새 원경 트랙은 "
+                                  "버린다. 파편화 튜닝 필요")
+                    self.exhausted += 1
+                    out.append(None)
+                    continue
                 best = self.next_id
                 self.next_id += 1
             used.add(best)
@@ -267,7 +322,7 @@ def analyze_video(path, detect_every=3, det_w=None, field_top_frac=0.26,
     # 원경 타일 검출용 미니 트래커 — 연결 반경은 파노라마 폭 비례
     # (~0.8%: 6540px→52px), 2초 놓치면 트랙 종료
     far_tracker = _FarTracker(radius=pano_w * 0.008,
-                              max_miss=2.0 * fps / detect_every)
+                              max_miss=2.0 * fps / detect_every, log=log)
     frames_idx, balls, players = [], [], []
     ball_cands = []
     import time
@@ -375,6 +430,8 @@ def analyze_video(path, detect_every=3, det_w=None, field_top_frac=0.26,
                                 < max(fp[3], 25.0) ** 2 for p in prow)]
             ftids = far_tracker.update(fresh, len(frames_idx))
             for (fx, fy, fc, fw_, fh_), ftid in zip(fresh, ftids):
+                if ftid is None:          # tid 범위 소진 — 건너뛴다
+                    continue
                 ty1, ty2 = int(fy - fh_ / 2), int(fy)
                 tx1, tx2 = int(fx - fw_ * 0.3), int(fx + fw_ * 0.3)
                 torso = frame[max(ty1, 0):max(ty2, 1), max(tx1, 0):max(tx2, 1)]
@@ -435,9 +492,9 @@ def augment_far_persons(video_path, analysis, far_band_frac=0.58,
 
     메인 패스·트래커 tid·기존 검출과 사용자 편집(.ptz.json 의 역할/병합/
     번호는 tid 로 연결)은 그대로 두고, 원경 밴드만 네이티브 타일로
-    재검출해 기존 박스와 겹치지 않는 사람을 _FarTracker tid(800001+)로
+    재검출해 기존 박스와 겹치지 않는 사람을 _FarTracker tid(원경 범위)로
     병합한다 — 전체 재분석(tid 전부 교체 → 편집 고아화)의 저렴한 대안.
-    이미 800001+ 행이 있으면(재실행) 그 행도 중복 제거 기준에 포함되어
+    이미 원경 tid 행이 있으면(재실행) 그 행도 중복 제거 기준에 포함되어
     이중 추가되지 않는다. analysis 는 제자리 수정, 반환 = 추가 행 수.
     """
     from ultralytics import YOLO
@@ -452,7 +509,8 @@ def augment_far_persons(video_path, analysis, far_band_frac=0.58,
     y0b = int(analysis.get("field_top_frac", 0.26) * pano_h)
     y1b = int(pano_h * far_band_frac)
     frames = analysis["frames"]
-    ftrk = _FarTracker(radius=pano_w * 0.008, max_miss=2.0 * fps / de)
+    ftrk = _FarTracker(radius=pano_w * 0.008, max_miss=2.0 * fps / de,
+                       log=log)
     import time
     t0 = time.perf_counter()
     added = 0
@@ -477,6 +535,8 @@ def augment_far_persons(video_path, analysis, far_band_frac=0.58,
                                 < max(fp[3], 25.0) ** 2 for p in prow)]
             ftids = ftrk.update(fresh, k)
             for (fx, fy, fc, fw_, fh_), ftid in zip(fresh, ftids):
+                if ftid is None:          # tid 범위 소진 — 건너뛴다
+                    continue
                 ty1, ty2 = int(fy - fh_ / 2), int(fy)
                 tx1, tx2 = int(fx - fw_ * 0.3), int(fx + fw_ * 0.3)
                 torso = frame[max(ty1, 0):max(ty2, 1),
