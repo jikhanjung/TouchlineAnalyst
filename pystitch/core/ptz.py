@@ -346,9 +346,10 @@ def analyze_video(path, detect_every=3, det_w=None, field_top_frac=0.26,
             / "tracker_pano.yaml"
         tracker_cfg = str(cand) if cand.exists() else "botsort.yaml"
     log(f"[analyze] 트래커: {Path(str(tracker_cfg)).name}")
-    cap = cv2.VideoCapture(str(path))
-    if not cap.isOpened():
-        raise RuntimeError(f"열 수 없음: {path}")
+    # NVDEC 이 있으면 쓰고 없으면 CPU — 6K hevc 소프트 디코드가 분석 CPU 의
+    # 큰 몫이다 (실측 3.81코어 → 0.99코어, devlog 105).
+    from .gpudecode import FrameSource
+    cap = FrameSource(path, log=log)
     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     fps = cap.get(cv2.CAP_PROP_FPS)
     pano_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
@@ -387,7 +388,7 @@ def analyze_video(path, detect_every=3, det_w=None, field_top_frac=0.26,
                 ball_cands = ck["ball_cands"]
                 players = ck["players"]
                 i = int(ck["next_frame"])
-                cap.set(cv2.CAP_PROP_POS_FRAMES, i)
+                cap.seek_frame(i)
                 log(f"[analyze] 체크포인트 재개: {i}/{total} 프레임부터")
         except Exception as e:  # noqa: BLE001
             log(f"[analyze] 체크포인트 무시: {e}")
