@@ -7,6 +7,7 @@ PitchStitch/PitchAnalysis.py 의 가중평균 + 슬라이딩 윈도우 스무딩
 """
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import cv2
@@ -176,6 +177,42 @@ def is_extra_tid(tid) -> bool:
     """사용자가 직접 추가한 검출인가 (구 사이드카 포함)."""
     t = int(tid)
     return t >= EXTRA_TID_BASE or _LEGACY_EXTRA[0] <= t <= _LEGACY_EXTRA[1]
+
+
+# 짧은 원경 트랙 제외 문턱 (요약·팀분류 단계에서만 — **비파괴**).
+#
+# 0392 실측(devlog 104): 원경 트랙 130k 중 **절반 이상이 3샘플 이하**인데
+# 그것들이 나르는 관측은 전체의 **7.3%** 뿐이다. 반면 1.1초 이상 지속하는
+# 트랙(21.9%)이 관측의 **80.5%** 를 차지한다. 즉 "트랙릿 21만 개" 는
+# 계수 착시였고, 짧은 꼬리는 conf_far=0.1 이 만든 유령에 가깝다
+# (길이가 짧을수록 토르소 색이 잔디 쪽으로 단조 이동).
+#
+# 트래커 파라미터로는 못 고친다 — 실측상 원경 선수는 샘플당 0.5px 만
+# 움직여 반경 48px 는 9.4초분이고, 끊긴 뒤 48px 안에서 재시작하는 트랙은
+# 1.8% 뿐이다(재검출 자체가 없다). 그래서 **거르는 것**이 답이다.
+#
+# 분석 원본(.analysis.json)은 건드리지 않는다 — 문턱은 언제든 바꿀 수 있고
+# 재분석이 필요 없다. 0 이면 필터 끔.
+FAR_MIN_OBS_SEC = 1.0
+
+
+def far_min_obs(analysis) -> int:
+    """원경 트랙을 남길 최소 관측 수(샘플). 0 이면 거르지 않는다."""
+    env = os.environ.get("PYSTITCH_FAR_MIN_SEC")
+    try:
+        sec = float(env) if env else FAR_MIN_OBS_SEC
+    except ValueError:
+        sec = FAR_MIN_OBS_SEC
+    if sec <= 0:
+        return 0
+    fps = float(analysis.get("fps") or 30.0)
+    de = int(analysis.get("detect_every") or 3) or 1
+    return max(2, int(round(sec * fps / de)))
+
+
+def drop_short_far(tid, n_obs, min_obs) -> bool:
+    """이 트랙릿을 요약에서 뺄 것인가 (원경이면서 관측이 문턱 미만)."""
+    return bool(min_obs) and is_far_tid(tid) and n_obs < min_obs
 
 
 def extra_tid_number(tid) -> int:
@@ -803,6 +840,13 @@ def team_features(analysis):
                 f = int(frames[si]) if si < len(frames) else si
                 e = spans.setdefault(int(p[4]), [f, f])
                 e[1] = f
+    # 짧은 원경 트랙은 팀 색 투표에서도 뺀다 — 유령이 군집을 흔든다
+    min_obs = far_min_obs(analysis)
+    if min_obs:
+        for t in [t for t, v in feats.items()
+                  if drop_short_far(t, len(v), min_obs)]:
+            feats.pop(t, None)
+            spans.pop(t, None)
     ids = sorted(feats)
     return {"ids": ids,
             "X": (np.array([np.median(feats[t], axis=0) for t in ids])
@@ -1770,9 +1814,12 @@ def analysis_summary(analysis_path, analysis, log=print):
     from pathlib import Path as _P
     p = _P(str(analysis_path))
     cp = p.with_suffix(".cache.json")     # <pano>.analysis.cache.json
+    min_obs = far_min_obs(analysis)
     try:
         st = p.stat()
-        key = {"size": st.st_size, "mtime": int(st.st_mtime)}
+        # 문턱을 키에 넣는다 — 안 그러면 필터 이전 캐시가 그대로 재사용된다
+        key = {"size": st.st_size, "mtime": int(st.st_mtime),
+               "far_min": min_obs}
     except OSError:
         key = None
     if key is not None and cp.exists():
@@ -1813,7 +1860,18 @@ def analysis_summary(analysis_path, analysis, log=print):
                     e[1] = f
                     e[2] += 1
                 feet.setdefault(t, []).append((pl[0], pl[1] + pl[3] / 2.0))
-    colors = tracklet_colors(analysis)
+    # 짧은 원경 트랙 제외 — **요약에서만** (분석 원본은 불변)
+    if min_obs:
+        drop = [t for t, e in spans.items() if drop_short_far(t, e[2], min_obs)]
+        for t in drop:
+            spans.pop(t, None)
+            segs.pop(t, None)
+            feet.pop(t, None)
+        if drop:
+            log(f"[summary] 짧은 원경 트랙 {len(drop):,}개 제외 "
+                f"(<{min_obs}샘플) — 남은 트랙릿 {len(spans):,}개")
+    colors = {t: c for t, c in tracklet_colors(analysis).items()
+              if t in spans}
     foot_med = {t: (float(np.median([q[0] for q in v])),
                     float(np.median([q[1] for q in v])))
                 for t, v in feet.items()}

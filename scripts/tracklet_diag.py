@@ -111,3 +111,46 @@ for K in (2, 5, 10, 20, 40):
         print(f"  창 {K*SEC:4.1f}초 ({K:2d}샘플)  반경 {R:5.0f}px "
               f"({R/PANO_W*100:.1f}% 폭)  → 후보 있음 "
               f"{hit/len(ends)*100:5.1f}%")
+
+# ------------------------------------------- 간격 vs 거리 (반경 설계 근거)
+print("\n=== 끊긴 뒤 재시작까지의 (간격, 거리) — 가장 가까운 후보 ===")
+print("고정 반경이 맞는지, 간격에 비례해 넓혀야 하는지 가린다.")
+MAXK = 60
+pairs = []
+for tid, b, x, y in ends:
+    best = None
+    for s in range(b + 1, b + 1 + MAXK):
+        for tid2, x2, y2 in starts.get(s, ()):
+            dd = (x - x2) ** 2 + (y - y2) ** 2
+            if best is None or dd < best[1]:
+                best = (s - b, dd)
+    if best is not None:
+        pairs.append((best[0], best[1] ** 0.5))
+
+if pairs:
+    gaps = np.array([p[0] for p in pairs])
+    dist = np.array([p[1] for p in pairs])
+    print(f"후보를 찾은 종료 트랙 {len(pairs):,}/{len(ends):,} "
+          f"({len(pairs)/len(ends)*100:.1f}%), 창 {MAXK*SEC:.1f}초 내")
+    print(f"{'간격(초)':>9s} {'개수':>8s} {'거리 25%':>9s} {'중앙':>8s} "
+          f"{'75%':>8s}")
+    for lo, hi in ((1, 2), (3, 5), (6, 10), (11, 20), (21, 40), (41, 60)):
+        m = (gaps >= lo) & (gaps <= hi)
+        if m.sum() < 50:
+            continue
+        d = dist[m]
+        print(f"{lo*SEC:4.1f}~{hi*SEC:4.1f} {m.sum():8,d} "
+              f"{np.percentile(d,25):8.0f}px {np.median(d):7.0f}px "
+              f"{np.percentile(d,75):7.0f}px")
+    # 샘플당 이동 속도 추정 (중앙값 기울기)
+    med = [(g, np.median(dist[gaps == g])) for g in range(1, 21)
+           if (gaps == g).sum() >= 50]
+    if len(med) >= 3:
+        gg = np.array([m[0] for m in med], float)
+        dd = np.array([m[1] for m in med], float)
+        a, b_ = np.polyfit(gg, dd, 1)
+        print(f"\n중앙 거리 ≈ {a:.1f}px×간격 + {b_:.0f}px  "
+              f"→ 샘플당 {a:.1f}px ({a/SEC:.0f}px/초)")
+        print(f"현행 고정 반경 {CUR_R:.0f}px 는 간격 "
+              f"{max(0,(CUR_R-b_)/max(a,1e-9)):.1f}샘플"
+              f"({max(0,(CUR_R-b_)/max(a,1e-9))*SEC:.1f}초)까지만 커버")
