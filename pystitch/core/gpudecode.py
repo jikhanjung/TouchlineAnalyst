@@ -31,6 +31,43 @@ os.environ.setdefault("OPENCV_FFMPEG_READ_ATTEMPTS", "1000000")
 import cv2  # noqa: E402 — 위 환경변수가 먼저 잡혀야 한다
 
 
+# NVDEC 하드웨어 디코드 폭 한계 — 인코더(devlog 090)와 같은 구조다.
+# 넘으면 createVideoReader 가 assertion 으로 죽으면서 OpenCV ERROR 를
+# 시끄럽게 뱉으므로 **미리 거른다**. 구 파노라마는 h264 6348px 라
+# 여기 걸린다 (pano_0374 실측) — hevc 로 재인코드된 것만 NVDEC 을 탄다.
+NVDEC_H264_MAX_W = 4096
+NVDEC_HEVC_MAX_W = 8192
+
+
+def _is_hevc_tag(tag: str) -> bool:
+    """FOURCC 문자열이 HEVC 인가.
+
+    빌드마다 다르게 나온다 — 컨테이너 태그(`hvc1`/`hev1`)일 수도, **코덱
+    이름 그대로**(`hevc`)일 수도 있다. 실측(opencv 4.13)은 후자였고,
+    이걸 놓쳐 hevc 파노라마가 h264 한계(4096)에 걸려 NVDEC 을 건너뛰었다.
+    """
+    t = (tag or "").strip().strip("\x00").lower()
+    return t.startswith(("hev", "hvc")) or t in ("h265", "x265")
+
+
+def _too_wide_for_nvdec(path) -> str | None:
+    """NVDEC 로 못 여는 크기/코덱이면 사유 문자열, 가능하면 None."""
+    cap = cv2.VideoCapture(str(path))
+    try:
+        if not cap.isOpened():
+            return None                   # 열기 실패는 아래에서 처리
+        w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        cc4 = int(cap.get(cv2.CAP_PROP_FOURCC))
+        tag = "".join(chr((cc4 >> (8 * i)) & 0xFF) for i in range(4))
+    finally:
+        cap.release()
+    is_hevc = _is_hevc_tag(tag)
+    lim = NVDEC_HEVC_MAX_W if is_hevc else NVDEC_H264_MAX_W
+    if w > lim:
+        return f"폭 {w}px > {'hevc' if is_hevc else 'h264'} NVDEC 한계 {lim}"
+    return None
+
+
 def nvdec_available() -> bool:
     """cudacodec 으로 디코드할 수 있는가. `PYSTITCH_NVDEC=0` 이면 끈다."""
     if os.environ.get("PYSTITCH_NVDEC") == "0":
@@ -58,7 +95,10 @@ class FrameSource:
         self._pending = None              # NVDEC: 직전 grab 의 GpuMat
         self.backend = "cpu"
         self._r = None
-        if prefer_gpu and nvdec_available():
+        why = _too_wide_for_nvdec(self.path) if prefer_gpu else None
+        if why and log:
+            log(f"[decode] NVDEC 건너뜀 ({why}) — CPU")
+        if prefer_gpu and not why and nvdec_available():
             try:
                 self._open_gpu(0)
                 self.backend = "nvdec"

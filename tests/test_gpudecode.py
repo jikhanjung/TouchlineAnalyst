@@ -150,3 +150,20 @@ def test_nvdec_matches_cpu_frame_alignment(clip):
     for a, b in zip(got, ref):
         d = np.abs(a.astype(int) - b.astype(int)).mean()
         assert d < 12, f"프레임이 어긋난 것으로 보임 (평균차 {d:.1f})"
+
+
+@pytest.mark.parametrize("tag,expect", [
+    ("hevc", True),    # opencv 4.13 실측 — 코덱 이름 그대로 나온다
+    ("hvc1", True), ("hev1", True), ("h265", True), ("HEVC", True),
+    ("h264", False), ("avc1", False), ("mp4v", False), ("", False),
+])
+def test_hevc_tag_detection(tag, expect):
+    """빌드마다 FOURCC 표기가 달라 hevc 를 h264 로 오인하면 NVDEC 을 놓친다."""
+    from pystitch.core.gpudecode import _is_hevc_tag
+    assert _is_hevc_tag(tag) is expect
+
+
+def test_wide_hevc_is_allowed_but_wide_h264_is_not():
+    """폭 한계는 코덱마다 다르다 (h264 4096 / hevc 8192)."""
+    from pystitch.core.gpudecode import NVDEC_H264_MAX_W, NVDEC_HEVC_MAX_W
+    assert NVDEC_H264_MAX_W < 5976 <= NVDEC_HEVC_MAX_W
